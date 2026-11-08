@@ -1,0 +1,18 @@
+\begin{tabular}{llcccc}
+\toprule
+Model & Radius scaled by & Coverage & Vis.\ cov. & Occl.\ cov. & Mean radius \\
+\midrule
+SimCC-ViPNAS-MBV3 & Constant & 0.896 & 0.929 & 0.657 & 0.098 \\
+ & Distribution spread & 0.901 & 0.919 & 0.770 & 0.085 \\
+ & MC-Dropout, soft ($T{=}20$) & 0.900 & 0.924 & 0.719 & 0.091 \\
+\addlinespace
+SimCC-ResNet-50 & Constant & 0.898 & 0.931 & 0.658 & 0.091 \\
+ & Distribution spread & 0.899 & 0.918 & 0.762 & 0.078 \\
+ & MC-Dropout, soft ($T{=}20$) & 0.897 & 0.918 & 0.741 & 0.085 \\
+\addlinespace
+Heatmap-ResNet-50 & Constant & 0.896 & 0.932 & 0.641 & 0.090 \\
+ & Distribution spread & 0.902 & 0.906 & 0.875 & 0.132 \\
+ & MC-Dropout, soft ($T{=}20$) & 0.900 & 0.910 & 0.822 & 0.135 \\
+\addlinespace
+\bottomrule
+\end{tabular}

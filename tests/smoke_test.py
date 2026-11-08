@@ -18,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / 'mmpose'))
 
 import ua_pose  # noqa: F401
+from mmengine.registry import init_default_scope
 from mmengine.structures import InstanceData, PixelData
 from mmpose.registry import METRICS, MODELS
 from mmpose.structures import PoseDataSample
@@ -69,6 +70,7 @@ def make_dummy_simcc_samples(batch_size: int = 2, num_joints: int = 17, w: int =
 
 
 def main():
+    init_default_scope('mmpose')
     print('=' * 70)
     print('  UA-PoseEstimation Hardware & Architecture Verification')
     print('=' * 70)

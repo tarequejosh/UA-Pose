@@ -77,6 +77,7 @@ When running on the **Windows 11 PC (NVIDIA RTX 5060 + Core Ultra i7)**:
    - Automatically generates `figure1_predicted_skeletons_uncertainty.png`, `figure2_occlusion_and_pck_curves.png`, `figure3_quintiles_and_error_correlation.png`, and `q1_paper_table.tex`.
 2. **Fast Fine-Tuning (`run_experiments_windows.bat finetune`)**:
    - Fine-tunes `UA-SimCC + CompositionalTokenMixer + HeteroscedasticKLLoss` for 20 epochs from the COCO-pretrained checkpoints using AMP (`fp16`) on RTX 5060 (~20–40 mins).
-   - Demonstrates that adding trained heteroscedastic + compositional uncertainty pushes **Spearman $\rho$**, **Occlusion AUROC**, **AUSE**, and **ECE** to SOTA levels in a single forward pass.
+   - Measured outcome (2026-11-08, see `paper/main.pdf`): the learned sigma and OKS outputs did **not** beat the one-pass distribution spread on failure AUROC (sigma minus spread -0.008 over three seeds on ViPNAS-MobileNetV3), and the full head cost about 1 AP point there. The original expectation of "SOTA levels" was not supported.
 3. **Full Lightweight Backbone Training (`run_experiments_windows.bat train_soca`)**:
-   - Trains `SOCA-PRNet-34 + UA-SimCCHead` to establish our flagship lightweight uncertainty-aware pose estimator.
+   - Trains `SOCA-PRNet-34` against a plain ResNet-34 with the same SimCC head (60 epochs, one run each). Measured outcome: +0.44 +- 0.53 val-test AP points for SOCA, within fold variation. No "flagship" claim is supported.
+   - The supported experiment driver is now `scripts/run_experiments.py`; score with `scripts/score_all.py`.

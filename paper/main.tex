@@ -1,0 +1,847 @@
+\documentclass[preprint,11pt]{elsarticle}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{adjustbox}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+\graphicspath{{figures/}}
+\input{generated/macros.tex}
+
+% A result that does not exist yet. Must be empty before submission.
+\newcommand{\pending}[1]{\par\medskip\noindent\fcolorbox{orange}{orange!10}{%
+  \parbox{0.96\linewidth}{\small\textbf{PENDING, no result yet:} #1}}\par\medskip}
+
+% Name of the proposed method. Change it here only.
+\newcommand{\method}{SpreadCP}
+
+\journal{Pattern Recognition}
+
+\begin{document}
+\begin{frontmatter}
+
+\title{Training-Free Keypoint Uncertainty for Lightweight Pose Estimation: Failure Detection
+and Conformal Error Bounds from One Forward Pass}
+
+% PLACEHOLDER: author names, affiliations and corresponding email must be supplied.
+\author{[Author names and affiliations to be added]}
+
+\begin{abstract}
+Pose estimators in rehabilitation, ergonomics or robotics return wrong keypoints without warning,
+mostly under occlusion. Existing remedies add cost: MC-Dropout repeats inference, and
+learned uncertainty heads add parameters and training. We propose \method{}, a training-free module for
+coordinate-classification (SimCC) pose estimators. It reads the spread of the coordinate distributions
+the model already outputs, maps it to a calibrated failure probability, and scales split-conformal
+error bounds for each keypoint. It adds no parameters and
+\MethodCpuMs{}\,ms per person on one CPU thread. With every parameter fitted on a calibration split of
+COCO val2017 and every value reported on a disjoint test split, \method{} detected keypoint failures
+with AUROC \FaZsSimccMbvThreeDist{} and \FaZsSimccRFiveZeroDist{} on published SimCC models with
+ViPNAS-MobileNetV3 and ResNet-50, against \FaZsSimccMbvThreeMcSoft{} and \FaZsSimccRFiveZeroMcSoft{} for
+20-pass MC-Dropout, which stayed behind at every dropout rate tested. Against a constant radius, its
+conformal bounds changed the mean radius by \RadiusChangeZsSimccMbvThree\% on the lightweight model while
+raising
+occluded-joint coverage from \CovOccZsSimccMbvThreeConstant{} to \CovOccZsSimccMbvThreeDist{}. Across three
+RTMPose models and the heavily occluded OCHuman dataset, it beat MC-Dropout on every model and its
+bounds kept their coverage while narrowing, but it only matched RTMPose's default confidence at failure
+detection, and its COCO advantage at flagging occluded joints reversed on OCHuman. A trained
+uncertainty head did not improve on it: over three seeds, learned $\sigma$ minus spread was
+\SeedDfaHetMinusDist{} in failure AUROC, and the head changed AP by \SeedDapGt{} points. On a heatmap model the
+default confidence was as good, so \method{} is specific to coordinate classification.
+\end{abstract}
+
+\begin{keyword}
+human pose estimation \sep uncertainty estimation \sep failure detection \sep conformal prediction
+\sep coordinate classification \sep lightweight models
+\end{keyword}
+\end{frontmatter}
+
+\section{Introduction}
+
+A pose estimator that returns a wrong joint with no warning is a problem wherever the output
+drives a decision, as in rehabilitation, ergonomics or human--robot interaction. Occluded joints
+are the clearest case. On our test split, the SimCC ViPNAS-MobileNetV3 model places
+\pckVis{} of visible joints within the PCK@0.1 tolerance but only \pckOcc{} of occluded ones.
+
+The usual remedies add something to the model. MC-Dropout~\cite{gal2016dropout} repeats
+inference with dropout active, and heteroscedastic heads~\cite{kendall2017uncertainties} add
+parameters and a training run. Recent pose work has moved towards richer probabilistic outputs,
+including residual likelihoods~\cite{li2021rle}, calibration against object keypoint
+similarity~\cite{gu2024calibration}, and probabilistic formulations of the output
+map~\cite{purkrabek2025probpose}. Yet a coordinate-classification head~\cite{li2022simcc}
+already outputs a full 1D distribution for each axis. On a lightweight model meant for an edge
+device, every extra pass, parameter or training run counts, so it matters whether that distribution
+is already enough.
+
+We propose \method{}, a training-free uncertainty module for SimCC pose estimators
+(Section~\ref{sec:method}). From the two coordinate distributions of each keypoint it computes a
+spread score, maps the score to a failure probability with two Platt parameters, and scales a
+split-conformal error bound with it, so every keypoint comes with a radius that contains the true
+location at a chosen rate. The only fitting is on a small held-out calibration set, and the model
+itself is not changed. We test it against default confidence, entropy, flip disagreement, 20-pass
+MC-Dropout and a trained uncertainty head, under an evaluation plan fixed before any result was
+inspected (Section~\ref{sec:plan}).
+
+Our contributions are:
+\begin{itemize}
+\item \method{}, a module that turns the output of any SimCC model into calibrated keypoint failure
+probabilities and conformal error bounds, with no training, no added parameters and a measured
+overhead of \MethodCpuPct\% of a lightweight model's forward pass on one CPU thread;
+\item a held-out evaluation on five published SimCC-style models, including three sizes of RTMPose, on
+COCO and on the heavily occluded OCHuman dataset, in which \method{} detects failures better than 20-pass
+MC-Dropout on every model and dataset (at every dropout rate tested, with and without flip testing,
+where we varied these); it beats the default confidence of the original SimCC models and matches that of
+RTMPose, and it flags occluded joints better than the default confidence on COCO but worse on OCHuman;
+\item a comparison with a trained uncertainty head built for the same purpose (heteroscedastic,
+calibration and OKS terms, a token mixer and an adaptive target, in a five-arm ablation with three
+seeds for the main arm), which does not beat \method{} and costs AP on the lightweight backbone;
+\item spread-scaled conformal bounds that keep their coverage on both datasets and are tighter than a
+constant radius, covering more occluded joints on COCO and the same share at a smaller radius on
+OCHuman, together with their limits: the marginal guarantee does not reach the occluded subgroup, and
+the bounds do not help on a heatmap model; and
+\item a reproducible pipeline in which every number in the paper is generated from result files,
+and a list of implementation defects we found and fixed (\ref{app:defects}).
+\end{itemize}
+
+\section{Related work}
+
+\paragraph{Pose estimation heads} SimCC~\cite{li2022simcc} treats each coordinate as a
+classification over sub-pixel bins, and RTMPose~\cite{jiang2023rtmpose} builds a real-time
+pipeline on the same idea. Heatmap models such as SimpleBaseline~\cite{xiao2018simple} regress a
+2D map. PCT~\cite{geng2023pct} represents a pose as compositional tokens, the inspiration for the
+token mixer we evaluate. ViPNAS~\cite{xu2021vipnas} supplies our lightweight backbone, and
+SOCA-PRNet~\cite{zakir2024soca} adds attention to a PoseResNet, drawing on global
+context~\cite{cao2019gcnet} and coordinate attention~\cite{hou2021coordinate}.
+
+\paragraph{Uncertainty in pose estimation} RLE~\cite{li2021rle} learns a residual likelihood for
+regression. Gu et al.~\cite{gu2024calibration} study the mismatch between predicted confidence
+and OKS, and train a confidence target aligned with OKS, which we reuse as one component of the
+learned head. ProbPose~\cite{purkrabek2025probpose} develops a probabilistic formulation of the
+keypoint output, and RTMO~\cite{lu2024rtmo} is a one-stage model with coordinate classification.
+More recent work covers post-hoc predictive distributions for YOLO-Pose~\cite{klushyn2026yolopose},
+evidential pose estimation~\cite{henriques2026evidential}, and uncertainty-aware models for
+multi-person~\cite{huu2025contextual} and motor-ability-specific~\cite{wang2026motor} settings.
+% AUTHORS: Henriques, Huu and Wang were checked from citation records or abstracts only, and are cited
+% for scope. Read the full texts before submission. See the notes in references.bib.
+These methods add parameters, a training objective or repeated sampling. \method{} instead reads
+the distribution that a SimCC head already produces. Using the dispersion of a predicted
+distribution as an uncertainty score is a natural idea, and we do not claim it as new in itself. Our
+contribution is a calibrated, conformal module built on it for SimCC pose models, and a held-out
+test of whether costlier machinery improves on it.
+
+\paragraph{Evaluating uncertainty} Sparsification and AUSE come from optical
+flow~\cite{ilg2018uncertainty}. Comparisons of regression uncertainty
+metrics~\cite{lind2024metrics,levi2022evaluating} motivate reporting several metrics, not one.
+We use Platt scaling~\cite{platt1999probabilistic} and report ECE~\cite{guo2017calibration} after
+calibration. Split conformal
+prediction~\cite{angelopoulos2021gentle} has been applied to keypoints for object
+pose~\cite{yang2023conformal}. Benchmark variance~\cite{bouthillier2021variance} motivates our
+paired intervals and repeated seeds.
+
+\section{Proposed method: \method{}}\label{sec:method}
+
+\method{} sits after a trained SimCC model and before whatever consumes its keypoints. It has three
+steps, of which only the last two need fitting, and both fit on a held-out calibration set.
+
+\paragraph{Spread score} For keypoint $k$, a SimCC head outputs logits over $W$ horizontal and $H$
+vertical bins. Let $p_x$ and $p_y$ be the distributions the model was trained to output,
+$\mathrm{softmax}(\beta z)$ of the logits $z$, where $\beta$ is the temperature of its training loss
+($\beta=1$ for the original SimCC models, $\beta=10$ for RTMPose). $\beta$ is read from the model's
+definition and is not fitted. Let $b_i = i/r$ be the bin centres in input pixels, with $r$ the split
+ratio. The score is the joint standard deviation
+\begin{equation}
+u_k = \sqrt{\mathrm{Var}_{p_x}[b] + \mathrm{Var}_{p_y}[b]}, \qquad
+\mathrm{Var}_{p}[b] = \sum_i p(i)\,\big(b_i - \textstyle\sum_j p(j) b_j\big)^2 .
+\end{equation}
+A sharp, unimodal distribution gives a small $u_k$. An occluded or ambiguous joint tends to give a
+wide or multi-modal one, and so a large $u_k$. The score uses the logits of the pass that produced the
+keypoint, needs no second pass, and is in pixels, so it can be compared across joints and models.
+
+\paragraph{Calibrated failure probability} A keypoint fails when its error, normalised by the square
+root of its box area, is at least $0.1$ (the complement of PCK@0.1). \method{} maps the score to a
+failure probability with Platt scaling~\cite{platt1999probabilistic} on its logarithm,
+\begin{equation}
+\hat P(\text{fail}\mid u_k) = \mathrm{sigmoid}\big(a \log u_k + c\big),
+\end{equation}
+with $a$ and $c$ fitted by logistic regression on the calibration set.
+
+\paragraph{Conformal error bounds} For a target coverage $1-\alpha$, \method{} uses split conformal
+prediction~\cite{angelopoulos2021gentle} with the score as a local scale. On $n$ calibration keypoints
+with normalised errors $e_j$ it takes the ratios $e_j / u_j$ and sets $\hat q$ to the $\lceil
+(n+1)(1-\alpha) \rceil$-th smallest. The region for a new keypoint is a disc of normalised radius
+$\hat q\, u_k$ around the prediction, that is $\hat q\, u_k \sqrt{A_{\text{box}}}$ pixels for a box of
+area $A_{\text{box}}$. If calibration and test keypoints are exchangeable, the region contains the
+true location with probability at least $1-\alpha$, marginally over keypoints. Uncertain keypoints get
+wider regions and confident ones narrower, where a constant radius would treat them alike. We use
+$1-\alpha = 0.9$.
+
+\paragraph{Optional instance rescoring} The same score can down-weight uncertain keypoints in the
+instance score that COCO AP ranks by. We evaluate two such rules (Section~\ref{sec:rescoring}) but do
+not count them as part of the method, since they did not move AP meaningfully.
+
+\paragraph{Cost} The module adds two softmax operations and two weighted sums per keypoint, plus a
+sigmoid and a multiplication. It adds no parameters and needs no change to the model or its training.
+Its measured overhead is in Section~\ref{sec:cost}.
+
+\section{Experimental setup}
+
+\subsection{Evaluation plan and data}\label{sec:plan}
+
+The evaluation questions, metrics and training arms were written down before the first benchmark
+run, and later changes were logged with their reasons (\texttt{paper/ANALYSIS\_PLAN.md}). The plan
+asked four questions: whether one-pass signals match 20-pass MC-Dropout on pretrained models, whether
+a trained uncertainty head improves on them, what the added machinery costs, and whether
+uncertainty-based rescoring raises AP. The paper was framed around \method{} after all results were
+in. That changed the presentation, not any metric, split or comparison. The dropout-rate
+sweep, the no-flip dumps, the widened rescoring grids and one training arm
+(Section~\ref{sec:arms}) were added after seeing results, and we label them exploratory.
+
+Training uses COCO~\cite{lin2014coco} train2017 only. COCO val2017 is split once at image level,
+with a fixed seed, into a calibration part of \numCalImages{} images and a test part of
+\numTestImages{} images. Platt parameters, fusion weights, rescoring parameters and conformal
+quantiles are fitted on the calibration part. Every reported metric comes from the test part,
+except the reproduction check in Table~\ref{tab:sanity}, which uses all images to match the
+published protocol. Reported checkpoints are those of the final epoch, so no checkpoint is chosen
+using evaluation images.
+
+Keypoint-level metrics use ground-truth boxes, since occlusion flags need a correspondence with
+annotations. The test part contains \numKptTest{} labelled keypoints from \numImgKptTest{} images
+with labelled people: \numVisTest{} visible ($v{=}2$) and \numOccTest{} occluded ($v{=}1$).
+Unlabelled keypoints are excluded.
+
+\subsection{Models}
+
+We use the published MMPose~\cite{mmpose2020} checkpoints of SimCC with ViPNAS-MobileNetV3
+(input $256\times192$), SimCC with ResNet-50, and a SimpleBaseline ResNet-50 heatmap model. Flip
+testing is on unless stated otherwise. Detector-box AP uses torchvision's Faster R-CNN R50-FPN v2
+person boxes. Their person box AP is \detBoxAp{} (AP$_{50}$ \detBoxApFifty{}), whereas the file
+behind the published MMPose numbers is named for AP \detBoxApPublished{}, so the comparison with
+published AP in Table~\ref{tab:sanity} is approximate.
+
+\subsection{Baselines}\label{sec:signals}
+
+\method{}'s score is compared with every other signal the pipeline can produce. With $p_x$, $p_y$ and
+$b_i$ as in Section~\ref{sec:method}:
+\begin{itemize}
+\item \textbf{Peak confidence}: the model's default score, derived from the raw logits. For
+SimCC it is unbounded above by construction, so it is not a probability.
+\item \textbf{Peak probability}: $\min(\max_i p_x(i), \max_i p_y(i))$.
+\item \textbf{Distribution spread} (\method{}'s score): $u_k$ from Section~\ref{sec:method}. On the
+heatmap model, the analogous spatial standard deviation around a temperature-sharpened soft-argmax,
+which tests whether the idea carries over to 2D maps.
+\item \textbf{Entropy}: the mean of the two axes' Shannon entropies, each normalised to $[0,1]$.
+\item \textbf{Flip disagreement}: the distance between the decoded coordinates of the original
+and flipped views.
+\item \textbf{MC-Dropout}, $T{=}20$: the coordinate standard deviation over stochastic passes,
+with \emph{argmax} and \emph{soft-expectation} decoders, both kept so that the baseline is not
+handicapped by the decoder choice.
+\item \textbf{Fusion}: logistic regression on peak confidence, spread, entropy and flip
+disagreement, fitted on the calibration part only.
+\item \textbf{Learned $\sigma$ and learned OKS}: outputs of the trained head
+(Section~\ref{sec:learned}), reported only for arms that trained them.
+\end{itemize}
+
+MC-Dropout is applied in the \emph{head} only, on the features of one unflipped pass:
+at the feature layer before the SimCC classifiers (and in the mixer, when present), and as
+spatial dropout after each deconvolution on the heatmap model. The backbones contain no dropout.
+The pretrained models were not trained with this dropout, so on them it is a perturbation rather
+than a trained posterior approximation. The \texttt{base} arm in Section~\ref{sec:arms} addresses
+this by training with the dropout active.
+
+\subsection{Trained uncertainty head}\label{sec:learned}
+
+The strongest baseline is a head trained for uncertainty on the same backbones. It adds a per-joint log-variance $s_k$ and an OKS logit, with an optional token mixer. With
+$D$ the per-axis KL divergence summed over bins, the loss adds to SimCC's KL term
+\begin{align}
+\mathcal{L}_{\text{het}} &= \tfrac{1}{2} e^{-s}\, D + \tfrac{1}{2} s
+  && \text{attenuation~\cite{kendall2017uncertainties}},\\
+\mathcal{L}_{\text{cal}} &= |r|\, e^{-s/2} + \tfrac{1}{2} s
+  && \text{Laplace NLL on the decoded residual } r,\\
+\mathcal{L}_{\text{oks}} &= \mathrm{BCE}\big(z,\ e^{-d^2 / (2A(2\kappa)^2)}\big)
+  && \text{OKS target, after~\cite{gu2024calibration}},
+\end{align}
+where $r$ and $s$ are in units of the target width $\sigma_0$, $d$ is the decoded error in input
+pixels, $\kappa$ the COCO falloff constant of the joint, and $A$ the median train2017 person area
+in crop pixels. The optional adaptive target is an equal mix of the original label and a Gaussian whose width is
+scaled by $e^{s/2}$, clamped to $[0.7, 2.5]$, with $s$ detached. Weights are $0.5$, $0.2$ and $0.2$. The token mixer starts as an
+identity through a zero-initialised residual, so it cannot degrade the pretrained model at the
+start of training.
+
+\subsection{Training arms}\label{sec:arms}
+
+Each arm fine-tunes the published checkpoint for 20 epochs on one GPU: AdamW, batch size 64,
+learning rate $3\times10^{-4}$ for new modules with multipliers $0.1$ (backbone) and $0.2$
+(deconvolution head), cosine decay, mixed precision, and gradient clipping at norm 1. The arms
+accumulate components: \texttt{base} (KL only, the control), \texttt{het}
+($+\mathcal{L}_{\text{het}},\mathcal{L}_{\text{cal}}$), \texttt{het\_oks}
+($+\mathcal{L}_{\text{oks}}$), \texttt{mix} (+ token mixer) and \texttt{full} (+ adaptive target).
+
+One arm is exploratory. At an interim check on all val2017 images, \texttt{full} had AP
+\interimApFull{} at epoch 5 against \interimApBase{} for \texttt{base}, with gradient norms of
+about 100 before clipping. We suspected that $e^{-s}$ in $\mathcal{L}_{\text{het}}$, which grows
+as accurate joints reach a low $s$, multiplies the pose gradient. We kept all planned arms and
+added \texttt{full\_sg}, identical to \texttt{full} except that $D$ is detached in
+$\mathcal{L}_{\text{het}}$. Because an evaluation-set number motivated it, its results are
+reported separately and do not replace \texttt{full}.
+
+The SOCA-PRNet comparison trains two backbones from ImageNet weights with the same SimCC head and the
+KL loss only: a plain ResNet-34 and SOCA-PRNet-34, which is the same ResNet-34 with SOCA attention and,
+as part of its design, dropout of 0.05 inside the backbone. Both use AdamW with learning rate
+$5\times10^{-4}$ and weight decay $10^{-4}$, batch size 64, a 500-iteration linear warm-up, and 60 epochs
+with the learning rate divided by 10 after epochs 48 and 57. This is shorter than the 210-epoch schedule
+of the published models, so neither result can be compared with published numbers. Each backbone was
+trained once.
+
+\subsection{Metrics}
+
+A keypoint \emph{fails} when its error, normalised by the square root of its box area, is at
+least $0.1$. Primary metrics are failure AUROC, AUSE on normalised error (retained fractions
+$0.1$ to $1$), and occlusion AUROC ($v{=}1$ against $v{=}2$). AUROC handles ties by average rank,
+and sparsification breaks ties randomly. Secondary metrics are Spearman $\rho$ with error, ECE
+after Platt scaling, and the coverage and mean radius of conformal regions at 90\% target coverage.
+Every baseline signal gets the same Platt and conformal treatment as \method{}'s score, so the
+comparison is between signals and not between fitting procedures. A constant radius, the conformal
+region with $u_k = 1$, is the reference for radius.
+
+Intervals are percentile 95\% over \numBoot{} image-level bootstrap resamples, with the same
+resamples for all signals, so paired differences are valid. We call a difference supported only
+if its interval excludes zero. AP comes from pycocotools with the MMPose score mode and OKS-NMS.
+Rescoring differences are the mean paired difference over 10 disjoint folds of the test part.
+
+\subsection{Instance rescoring}\label{sec:rescoring}
+
+The default instance score is the box score times the mean confident keypoint score. We compare
+exponential decay of keypoint scores $c_k e^{-\alpha u_k}$, with $u_k$ normalised by its mean, and
+an instance score of the box score times the mean closed-form expected OKS under isotropic Gaussian
+error, $(1+(\gamma\sigma)^2/(2c))^{-1}$ with $c=A(2\kappa)^2$. Parameters $\alpha$ and $\gamma$ are
+selected on the calibration part. Expected OKS is omitted for the heatmap model because its spread
+is not in pixel units.
+
+\subsection{Cost measurement}
+
+Latency uses batch size 1, 50 warm-up runs and 300 timed runs, reporting the median, on an RTX 5060
+(8\,GB) and on one CPU thread of a Core Ultra i7. No training job was running on the GPU, though
+desktop applications were. FLOPs and parameters come from the unmodified MMPose models where
+marked ``plain''. \method{}'s own overhead is timed the same way on the operations it adds, at the
+tensor shapes of a $256\times192$ COCO SimCC model (17 keypoints, 384 and 512 bins), on an otherwise
+idle GPU. For tensors this small the GPU time is dominated by kernel launches, so it exceeds the CPU
+time.
+
+\section{Results}
+
+\subsection{Reproduction check}
+
+Table~\ref{tab:sanity} shows that our pipeline reproduces published AP to within 0.4 points on
+detector boxes (\ApDetZsSimccRFiveZero{} vs \ApPubZsSimccRFiveZero{},
+\ApDetZsSimccMbvThree{} vs \ApPubZsSimccMbvThree{}, and \ApDetZsHmRFiveZero{} vs
+\ApPubZsHmRFiveZero{}), despite the different detector.
+
+\begin{table}[t]
+\centering\small
+\caption{AP on all val2017 images, with default instance scores.
+$^\dagger$MMPose model zoo values, not re-measured, obtained with a different detector.}
+\label{tab:sanity}
+\adjustbox{max width=\linewidth}{\input{tables/sanity.tex}}
+\end{table}
+
+\subsection{Failure detection on published models}
+
+Table~\ref{tab:zeroshot} is the main result, on the published checkpoints with no training. On SimCC,
+\method{}'s spread score had the highest failure AUROC and lowest AUSE of all signals on both
+backbones. Its paired AUROC gain over soft
+MC-Dropout was \DfaZsSimccMbvThreeDistMinusMc{} on ViPNAS-MobileNetV3 and
+\DfaZsSimccRFiveZeroDistMinusMc{} on ResNet-50. Spread also improved on the default peak confidence
+of the same model, by \DfaZsSimccMbvThreeDistMinusConf{} and \DfaZsSimccRFiveZeroDistMinusConf{},
+so the default score is not the best one the head already provides. On the heatmap model, the
+default peak confidence was about level with spread, with both above soft MC-Dropout by
+\DfaZsHmRFiveZeroConfMinusMc{} and \DfaZsHmRFiveZeroDistMinusMc{}. So the spread's advantage over
+peak confidence is specific to the SimCC results here, whereas the gap to MC-Dropout holds across
+all three models. Figure~\ref{fig:sparsification} shows the same order across retained fractions.
+Logistic fusion did not improve on the best single signal in failure AUROC on SimCC, and its
+intervals overlap those of the best single signal on the heatmap model.
+
+\begin{table}[t]
+\centering\scriptsize\setlength{\tabcolsep}{3pt}
+\caption{Zero-shot uncertainty on the test split, with bootstrap 95\% intervals on failure AUROC.
+Bold marks the best value per column within a model.
+All values use flip-test predictions, so ``1 pass'' counts what the signal itself requires:
+$^\ast$these need the second, flipped pass.}
+\label{tab:zeroshot}
+\resizebox{\linewidth}{!}{\input{tables/zeroshot.tex}}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{sparsification.pdf}
+\caption{Sparsification on the test split: mean error of the keypoints retained after discarding
+the most uncertain ones. Lower is better, and the oracle sorts by the true error. Values are in
+Table~\ref{tab:zeroshot} (AUSE).}
+\label{fig:sparsification}
+\end{figure}
+
+\paragraph{Dropout rate} The planned rate of $0.1$ could have been a poor choice, so we repeated
+inference at $p\in\{0.05,0.2,0.3,0.5\}$ (exploratory). The best MC-Dropout result over all rates and
+both decoders was \SweepBestZsSimccMbvThree{} on ViPNAS-MobileNetV3 (\SweepBestVariantZsSimccMbvThree{},
+$p{=}\SweepBestRateZsSimccMbvThree$), \SweepBestZsSimccRFiveZero{} on ResNet-50
+(\SweepBestVariantZsSimccRFiveZero{}, $p{=}\SweepBestRateZsSimccRFiveZero$), and
+\SweepBestZsHmRFiveZero{} on the heatmap model (\SweepBestVariantZsHmRFiveZero{},
+$p{=}\SweepBestRateZsHmRFiveZero$). All are below the corresponding best one-pass signal
+(Table~\ref{tab:sweep}, Figure~\ref{fig:sweep}). No rate closes the gap.
+
+\begin{table}[t]
+\centering\small
+\caption{Failure AUROC of soft MC-Dropout ($T{=}20$) by dropout rate, against one-pass spread.
+Exploratory. Figure~\ref{fig:sweep} also shows the argmax decoder.}
+\label{tab:sweep}
+\adjustbox{max width=\linewidth}{\input{tables/sweep.tex}}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{sweep.pdf}
+\caption{Failure AUROC against dropout rate. One-pass signals are flat lines because they do not
+depend on the rate.}
+\label{fig:sweep}
+\end{figure}
+
+\paragraph{Flip testing} Table~\ref{tab:zeroshot} uses flip-test predictions, so its one-pass
+signals in fact come from two backbone passes. With flip testing off (exploratory), spread reached
+\FaNoflipZsSimccMbvThreeDist{} and \FaNoflipZsSimccRFiveZeroDist{} on SimCC, and peak confidence
+\FaNoflipZsHmRFiveZeroConf{} on the heatmap model, against \FaNoflipZsSimccMbvThreeMcSoft{},
+\FaNoflipZsSimccRFiveZeroMcSoft{} and \FaNoflipZsHmRFiveZeroMcSoft{} for soft MC-Dropout, so the
+one-pass claim holds in the strict sense too.
+
+\paragraph{Occlusion} Occlusion AUROC follows the same pattern, at a lower level. The best
+signal reached \OaZsSimccMbvThreeFusion{}, \OaZsSimccRFiveZeroFusion{} and \OaZsHmRFiveZeroDist{}
+on the three models, compared with \OaZsSimccMbvThreeMcSoft{}, \OaZsSimccRFiveZeroMcSoft{} and
+\OaZsHmRFiveZeroMcSoft{} for soft MC-Dropout. Figure~\ref{fig:qualitative} shows instances selected
+by a fixed rule, not by hand.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{qualitative.pdf}
+\caption{SimCC ViPNAS-MobileNetV3 on test instances chosen by rule: of those with at least 3
+occluded and 6 visible labelled joints and a box side of at least 150 pixels, the four with the
+largest gap between occluded and visible mean error. These are selected failures and do not show
+typical accuracy.}
+\label{fig:qualitative}
+\end{figure}
+
+\subsection{Conformal error bounds}
+
+Table~\ref{tab:conformal} gives the conformal results, with the same procedure applied to each scale.
+All variants reach close to the 90\% marginal target, as the construction guarantees. A constant radius covered only
+\CovOccZsSimccMbvThreeConstant{} and \CovOccZsSimccRFiveZeroConstant{} of occluded joints on SimCC.
+Scaling by spread raised this to \CovOccZsSimccMbvThreeDist{} and \CovOccZsSimccRFiveZeroDist{}, and
+changed the mean radius by \RadiusChangeZsSimccMbvThree\% and \RadiusChangeZsSimccRFiveZero\%. On
+the heatmap model it raised occluded coverage to \CovOccZsHmRFiveZeroDist{}, but at the price of a
+\RadiusChangeZsHmRFiveZero\% larger radius, so the benefit there is a trade-off and not a clear gain.
+Occluded coverage remains below the marginal target in every case: this marginal guarantee does not
+extend to the occluded subgroup.
+
+\begin{table}[t]
+\centering\small
+\caption{Split-conformal regions at 90\% target coverage. Radii are in normalised error units.}
+\label{tab:conformal}
+\adjustbox{max width=\linewidth}{\input{tables/conformal.tex}}
+\end{table}
+
+\subsection{Current lightweight models: RTMPose}\label{sec:rtmpose}
+
+RTMPose~\cite{jiang2023rtmpose} is the current family of real-time SimCC-style models. We evaluated its
+published COCO checkpoints at three sizes, from RTMPose-t (\ParamsRtmposeT{}\,M parameters,
+\FlopsRtmposeT{}\,GFLOPs, \CpuOneRtmposeT{}\,ms per person on one CPU thread) to RTMPose-m, with the same
+split, signals and metrics as above and no retraining (Table~\ref{tab:rtmpose}). This evaluation was
+added after the main study. With detector boxes our pipeline reproduced the published AP to within 0.2
+points (\ApDetZsRtmposeT{}, \ApDetZsRtmposeS{} and \ApDetZsRtmposeM{} against \ApPubZsRtmposeT{},
+\ApPubZsRtmposeS{} and \ApPubZsRtmposeM{}). \method{} adds \MethodCpuPctRtmT\% to the CPU time of
+RTMPose-t.
+
+Three findings carry over and one does not. \method{}'s score again beat 20-pass head MC-Dropout on
+every model, by \DfaZsRtmposeTDistMinusMc{}, \DfaZsRtmposeSDistMinusMc{} and \DfaZsRtmposeMDistMinusMc{}
+in failure AUROC, though the gap narrows as the model grows. It detected occluded joints better than the
+default confidence on every model, by \DoaZsRtmposeTDistMinusConf{}, \DoaZsRtmposeSDistMinusConf{} and
+\DoaZsRtmposeMDistMinusConf{} in occlusion AUROC. And its conformal bounds changed the mean radius by
+\RtmRadiusRange\% against a constant radius while raising coverage of occluded joints, for RTMPose-t from
+\CovOccZsRtmposeTConstant{} to \CovOccZsRtmposeTDist{}. What did not carry over is the gain over the
+default confidence in failure detection: on RTMPose the two could not be separated
+(\DfaZsRtmposeTDistMinusConf{}, \DfaZsRtmposeSDistMinusConf{} and \DfaZsRtmposeMDistMinusConf{}), and the
+default confidence had the lower AUSE (spread minus confidence \DauseZsRtmposeTDistMinusConf{} on
+RTMPose-t, $\times10^{-3}$). RTMPose's loss applies a softmax to its Gaussian targets and a temperature
+to its logits, which may give its default score a better ranking than the original SimCC models have;
+we did not test this. The spread
+was also not the best single signal there: entropy was ahead on RTMPose-t
+(\DfaZsRtmposeTEntropyMinusDist{}) and logistic fusion on RTMPose-t and RTMPose-s
+(\DfaZsRtmposeTFusionMinusDist{} and \DfaZsRtmposeSFusionMinusDist{}), while the spread led entropy on
+occlusion on all three. We keep the spread as defined before these models were seen. Rescoring did not
+help on RTMPose: calibration selected little or no exponential decay ($\Delta$AP \RtmRescoreExpAlphaDistGt{}
+points with ground-truth boxes), and expected OKS lowered AP by \RtmRescoreEoksDistGt{} and
+\RtmRescoreEoksDistDet{} points with ground-truth and detector boxes.
+
+\begin{table}[t]
+\centering\small
+\caption{RTMPose with published COCO weights, no retraining. AP is on all val2017 images as a
+reproduction check; uncertainty metrics are on the test split. ``Spread minus'' columns are paired
+failure AUROC differences. Occluded coverage is for 90\% conformal regions with a constant radius and
+with \method{}'s spread. $^\dagger$MMPose model zoo values with a different detector, not re-measured.}
+\label{tab:rtmpose}
+\adjustbox{max width=\linewidth}{\input{tables/rtmpose.tex}}
+\end{table}
+
+\subsection{Cross-dataset test under heavy occlusion: OCHuman}\label{sec:ochuman}
+
+OCHuman~\cite{zhang2019pose2seg} shows people heavily occluded by other people. We ran the six published
+COCO models on it without retraining and used its official split: every fitted quantity on OCHuman val
+(\ochNumCalImages{} images) and every reported value on OCHuman test (\ochNumTestImages{} images,
+\ochNumKptTest{} labelled keypoints, of which \ochNumOccTest{} occluded). This evaluation was planned
+and logged before any OCHuman result was computed. The models are much less accurate here: PCK@0.1 on
+occluded joints was \PckOccOchSimccMbvThree{} for SimCC-ViPNAS-MobileNetV3 and \PckOccOchRtmposeM{} for
+RTMPose-m, against \PckVisOchSimccMbvThree{} and \PckVisOchRtmposeM{} on visible ones. Every signal was
+weaker as well: the best failure AUROC per model was \ochBestFaRange{}, against \cocoBestFaRange{} on COCO
+(Table~\ref{tab:ochuman}).
+
+Two COCO findings held. \method{}'s score beat 20-pass MC-Dropout on all \ochNumSimcc{} SimCC-style
+models, from \DfaOchRtmposeM{} on RTMPose-m to \DfaOchSimccMbvThree{} on SimCC-ViPNAS-MobileNetV3, and it
+again beat the default confidence on the original SimCC models (\DfaconfOchSimccMbvThree{} and
+\DfaconfOchSimccRFiveZero{}) while matching it on RTMPose. The conformal bounds kept their coverage under
+this harder distribution, from \ochCoverageRange{} for every model and scale, and against the
+constant radius \method{} changed the mean radius by \ochRadiusRange\% on the SimCC-style models at about
+the same occluded coverage (for SimCC-ViPNAS-MobileNetV3, \CovOccOchSimccMbvThreeDist{} against
+\CovOccOchSimccMbvThreeConstant{}). Here the gain is a tighter bound at equal coverage, where on COCO it
+was higher occluded coverage.
+
+One finding reversed. On OCHuman the spread detected occluded joints \emph{worse} than the default
+confidence on every SimCC-style model, by \DoaconfOchSimccMbvThree{} on SimCC-ViPNAS-MobileNetV3 and
+\DoaconfOchRtmposeM{} on RTMPose-m, where on COCO it had been better on all five. We did not test why. One
+possibility is that a joint hidden by another person often produces a sharp distribution on that
+person's joint, a confident error that a dispersion score cannot see. Occlusion detection should
+therefore not be read as a general property of \method{}. On the heatmap model the conformal radius grew
+by \RadiusChangeOchHmRFiveZero\%, as on COCO.
+
+\begin{table}[t]
+\centering\small
+\caption{OCHuman test, COCO-trained models without retraining, all fitting on OCHuman val. PCK is
+PCK@0.1 on occluded joints. ``Spread minus'' columns are paired failure AUROC differences, and the
+occlusion column the paired occlusion AUROC difference. Occluded coverage is for 90\% conformal regions.
+$^\ast$Heatmap model, for which the spread is not \method{}'s SimCC score.}
+\label{tab:ochuman}
+\adjustbox{max width=\linewidth}{\input{tables/ochuman.tex}}
+\end{table}
+
+\subsection{Comparison with a trained uncertainty head}\label{sec:headcmp}
+
+Could training for uncertainty beat a score that needs no training? This section fine-tunes the
+baseline head of Section~\ref{sec:learned} on the same backbones and compares its learned outputs
+with \method{}'s score computed on the same fine-tuned model, so both see identical weights.
+
+\paragraph{The control, and MC-Dropout after training} The \texttt{base} arm fine-tunes the
+ViPNAS-MobileNetV3 model for 20 epochs with KL only and head dropout active. Its AP on all val2017
+images was \ApGtFtMbvThreeBaseSZero{} with ground-truth boxes (pretrained: \ApGtZsSimccMbvThree{}) and
+\ApDetFtMbvThreeBaseSZero{} with detector boxes (pretrained: \ApDetZsSimccMbvThree{}), so the
+fine-tuning schedule itself does no harm. Training with dropout did help MC-Dropout: failure AUROC rose
+from \FaZsSimccMbvThreeMcSoft{} to \FaFtMbvThreeBaseSZeroMcSoft{} for the soft decoder and from
+\FaZsSimccMbvThreeMc{} to \FaFtMbvThreeBaseSZeroMc{} for argmax, and occlusion AUROC from
+\OaZsSimccMbvThreeMcSoft{} to \OaFtMbvThreeBaseSZeroMcSoft{}. The pretrained comparison in
+Table~\ref{tab:zeroshot} is therefore somewhat unfavourable to MC-Dropout. The ranking did not change:
+spread reached \FaFtMbvThreeBaseSZeroDist{} on the same model, and soft MC-Dropout minus spread was
+\DfaFtMbvThreeBaseSZeroMcSoftMinusDist{}. This is one seed on one backbone.
+
+\paragraph{The full learned head} The \texttt{full} arm adds the heteroscedastic, calibration and OKS
+terms, the token mixer and the adaptive target. Table~\ref{tab:ablation} compares it with the control.
+On ViPNAS-MobileNetV3 with seed 0 (other seeds below), the learned signals did not beat spread computed
+on the same model's output. Learned $\sigma$ minus spread was \DfaFtMbvThreeFullSZeroHetMinusDist{} in failure
+AUROC, \DauseFtMbvThreeFullSZeroHetMinusDist{} in AUSE ($\times 10^{-3}$, lower is better) and
+\DoaFtMbvThreeFullSZeroHetMinusDist{} in occlusion AUROC, so $\sigma$ was worse on the first two and
+not distinguishable on the third. The OKS head was further behind, at
+\DfaFtMbvThreeFullSZeroOksMinusDist{} in failure AUROC. Adding both to logistic fusion did not separate
+it from spread alone either (\DfaFtMbvThreeFullSZeroFusionMinusDist{}).
+
+The head also cost accuracy. On val-test, AP with ground-truth boxes was \ApTestGtFtMbvThreeFullSZero{}
+against \ApTestGtFtMbvThreeBaseSZero{} for the control, a mean paired fold difference of
+\DapGtFtMbvThreeFullSZero{} $\pm$ \DapSdGtFtMbvThreeFullSZero{} AP points, positive in
+\DapPosGtFtMbvThreeFullSZero{} folds. With detector boxes the difference was
+\DapDetFtMbvThreeFullSZero{} $\pm$ \DapSdDetFtMbvThreeFullSZero{} points. So the deficit seen at the
+interim check did not close by the final epoch. The median logged gradient norm before clipping, where
+each logged value is a 50-iteration mean, was \GradNormFtMbvThreeFullSZero{} for \texttt{full} and
+\GradNormFtMbvThreeBaseSZero{} for the control, against a clip threshold of 1.0.
+
+\begin{table}[t]
+\centering\small
+\caption{Fine-tuning arms, final-epoch checkpoints. AP is on val-test images. $\Delta$ is the mean
+paired difference from the control across 10 disjoint val-test folds, in AP points, with the SD across
+folds, for ground-truth (GT) and detector (det.) boxes. $^{\S}$Exploratory arm, added after an interim
+look at evaluation data (Section~\ref{sec:arms}).}
+\label{tab:ablation}
+\adjustbox{max width=\linewidth}{\input{tables/ablation.tex}}
+\end{table}
+
+\paragraph{Stopping the pose gradient (exploratory)} The \texttt{full\_sg} arm detaches $D$ in
+$\mathcal{L}_{\text{het}}$ and is otherwise identical to \texttt{full}. Its logged gradient norm stayed
+large, with a median of \GradNormFtMbvThreeFullSgSZero{}, so the detach did not remove the large norms that
+prompted this arm. On val-test its AP was \ApTestGtFtMbvThreeFullSgSZero{} with
+ground-truth boxes, \DapGtFtMbvThreeFullSgSZero{} $\pm$ \DapSdGtFtMbvThreeFullSgSZero{} points from the
+control and \DapSgVsFullGt{} $\pm$ \DapSdSgVsFullGt{} from \texttt{full} (positive in
+\DapPosSgVsFullGt{} folds). With detector boxes these were \DapDetFtMbvThreeFullSgSZero{} $\pm$
+\DapSdDetFtMbvThreeFullSgSZero{} and \DapSgVsFullDet{} $\pm$ \DapSdSgVsFullDet{} (positive in
+\DapPosSgVsFullDet{} folds). So on this seed the detach removed most of the AP loss, though not all of
+it. It did not change the ranking of the signals. Learned $\sigma$ minus spread was
+\DfaFtMbvThreeFullSgSZeroHetMinusDist{} in failure AUROC and \DauseFtMbvThreeFullSgSZeroHetMinusDist{} in
+AUSE, and only on occlusion AUROC did $\sigma$ come out ahead, by \DoaFtMbvThreeFullSgSZeroHetMinusDist{}.
+That occlusion difference is small. An evaluation-set number prompted this arm and it has one seed, so the
+AP recovery is a hypothesis for later work and not an established result.
+
+\paragraph{ResNet-50} The larger backbone repeats the signal result but not the size of the AP cost, on
+one seed. Learned $\sigma$ minus spread was \DfaFtRFiveZeroFullSZeroHetMinusDist{} in failure AUROC,
+\DauseFtRFiveZeroFullSZeroHetMinusDist{} in AUSE and \DoaFtRFiveZeroFullSZeroHetMinusDist{} in occlusion
+AUROC, so here $\sigma$ was worse on all three. The OKS head was at
+\DfaFtRFiveZeroFullSZeroOksMinusDist{} in failure AUROC, and fusion with both learned signals was not
+separated from spread (\DfaFtRFiveZeroFullSZeroFusionMinusDist{}). The AP difference from the control was
+\DapGtFtRFiveZeroFullSZero{} $\pm$ \DapSdGtFtRFiveZeroFullSZero{} points with ground-truth boxes and
+\DapDetFtRFiveZeroFullSZero{} $\pm$ \DapSdDetFtRFiveZeroFullSZero{} with detector boxes, each smaller than
+its SD across folds, so we cannot call it a cost on this backbone. Training with dropout again helped
+MC-Dropout, from \FaZsSimccRFiveZeroMcSoft{} to \FaFtRFiveZeroBaseSZeroMcSoft{} for the soft decoder, but
+it stayed behind spread (\DfaFtRFiveZeroBaseSZeroMcSoftMinusDist{}).
+
+\paragraph{Which component costs AP} The planned arms on ViPNAS-MobileNetV3 add one component at a time,
+on one seed. The first step carried most of the loss: \texttt{het}, which adds only the $\sigma$ head with
+$\mathcal{L}_{\text{het}}$ and $\mathcal{L}_{\text{cal}}$, differed from the control by
+\DapGtFtMbvThreeHetSZero{} $\pm$ \DapSdGtFtMbvThreeHetSZero{} points with ground-truth boxes (positive in
+\DapPosGtFtMbvThreeHetSZero{} folds) and \DapDetFtMbvThreeHetSZero{} $\pm$ \DapSdDetFtMbvThreeHetSZero{}
+with detector boxes. Measured directly against the arm before each, with ground-truth boxes, the OKS head
+changed AP by \StepGtFtMbvThreeHetOksSZero{} $\pm$ \StepSdGtFtMbvThreeHetOksSZero{} (positive in
+\StepPosGtFtMbvThreeHetOksSZero{} folds), the token mixer by \StepGtFtMbvThreeMixSZero{} $\pm$
+\StepSdGtFtMbvThreeMixSZero{} (\StepPosGtFtMbvThreeMixSZero{}) and the adaptive target by
+\StepGtFtMbvThreeFullSZero{} $\pm$ \StepSdGtFtMbvThreeFullSZero{} (\StepPosGtFtMbvThreeFullSZero{}). With
+detector boxes the adaptive-target step was \StepDetFtMbvThreeFullSZero{} $\pm$
+\StepSdDetFtMbvThreeFullSZero{} (\StepPosDetFtMbvThreeFullSZero{}). So the heteroscedastic and calibration
+terms are the main source of the cost, the OKS head shows no effect, and the adaptive target may add to it.
+These later steps are about the size of their fold SD, and folds capture image sampling but not variation
+between training runs, so they are weak evidence on one seed.
+
+No arm brought learned $\sigma$ level with spread on failure AUROC. The difference was
+\DfaFtMbvThreeHetSZeroHetMinusDist{} for \texttt{het}, \DfaFtMbvThreeHetOksSZeroHetMinusDist{} for
+\texttt{het\_oks} and \DfaFtMbvThreeMixSZeroHetMinusDist{} for \texttt{mix}. On occlusion AUROC these three
+arms could not be separated from spread (\DoaFtMbvThreeHetSZeroHetMinusDist{},
+\DoaFtMbvThreeHetOksSZeroHetMinusDist{} and \DoaFtMbvThreeMixSZeroHetMinusDist{}). The added components did
+not improve the signal either: $\sigma$ scored \FaFtMbvThreeHetSZeroHet{} in the simplest arm and
+\FaFtMbvThreeFullSZeroHet{} in \texttt{full}.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{ablation.pdf}
+\caption{Failure AUROC on val-test for each fine-tuning arm, one seed, with 95\% bootstrap intervals.
+Intervals from different signals on the same images are not independent, so paired differences in the
+text are the proper comparison. $^{\S}$Exploratory arm.}
+\label{fig:ablation}
+\end{figure}
+
+\paragraph{Repeated training runs} We trained \texttt{base} and \texttt{full} on ViPNAS-MobileNetV3 again
+with seeds 1 and 2 (Table~\ref{tab:seeds}). Each seed's AP difference is the paired fold mean against the
+control trained with the same seed, so the spread across seeds reflects variation between training runs,
+which the fold SD does not capture. The AP cost appeared on every seed: \SeedDapGt{} $\pm$ \SeedDapSdGt{}
+points with ground-truth boxes (mean and SD over \SeedCount{} seeds, range \SeedDapRangeGt{}) and
+\SeedDapDet{} $\pm$ \SeedDapSdDet{} with detector boxes (range \SeedDapRangeDet{}). The control itself was
+stable, at \ApTestGtFtMbvThreeBaseSZero{}, \ApTestGtFtMbvThreeBaseSOne{} and \ApTestGtFtMbvThreeBaseSTwo{}.
+The signal ranking also held. Learned $\sigma$ minus spread in failure AUROC was \SeedDfaHetMinusDist{}
+$\pm$ \SeedDfaHetMinusDistSd{} across seeds, with the 95\% interval below zero in
+\SeedDfaHetMinusDistBelow{} seeds. For the OKS head it was \SeedDfaOksMinusDist{} $\pm$
+\SeedDfaOksMinusDistSd{}, below zero in \SeedDfaOksMinusDistBelow{}. On occlusion AUROC, $\sigma$ minus
+spread averaged \SeedDoaHetMinusDist{}, with the interval above zero in \SeedDoaHetMinusDistAbove{} seeds
+and below zero in \SeedDoaHetMinusDistBelow{}. Three seeds give a rough estimate of run-to-run variation,
+not a precise one, and the ablation arms, \texttt{full\_sg} and ResNet-50 remain single runs.
+
+\begin{table}[t]
+\centering\small
+\caption{Seeds 0, 1 and 2 of the control and the full head on ViPNAS-MobileNetV3, mean $\pm$ SD across
+seeds. AP is on val-test with ground-truth boxes. $\Delta$ is each seed's mean paired fold difference
+from the control of the same seed, in AP points, then averaged across seeds. $\sigma$ and OKS are the
+learned head's outputs. AUROC values are on val-test.}
+\label{tab:seeds}
+\adjustbox{max width=\linewidth}{\input{tables/seeds.tex}}
+\end{table}
+
+\subsection{Cost}\label{sec:cost}
+
+\method{} adds a median of \MethodCpuMs{}\,ms per person on one CPU thread and at most
+\MethodGpuMs{}\,ms on the GPU, which is \MethodCpuPct\% and \MethodGpuPct\% of a single forward pass of
+the plain ViPNAS-MobileNetV3 model (\CpuOneMbvThreePlain{}\,ms and \GpuOneMbvThreePlain{}\,ms). It adds
+no parameters and no FLOPs that matter at this scale, and no training.
+
+Table~\ref{tab:cost} gives the cost of the baselines. The trained head adds little in FLOPs: from
+\FlopsMbvThreePlain{}\,G to \FlopsMbvThreeFull{}\,G on ViPNAS-MobileNetV3 including the mixer. Its
+parameter overhead matters more on the lightweight model, from \ParamsMbvThreePlain{}\,M to
+\ParamsMbvThreeFull{}\,M. Head-only MC-Dropout with $T{=}20$ costs far less than 20 forward passes
+because the backbone runs once: \GpuRatioMbvThreeHetOks{}$\times$ to \GpuRatioHmRFiveZero{}$\times$ a single
+pass on the GPU, and \CpuRatioMbvThreeHetOks{}$\times$ to \CpuRatioHmRFiveZero{}$\times$ on one CPU thread.
+So the case for \method{} over head MC-Dropout rests mainly on its stronger signal and not on latency,
+and any argument based on an assumed $20\times$ cost overstates the difference. The AP cost of the
+trained head is reported in Section~\ref{sec:headcmp}.
+
+\begin{table}[t]
+\centering\scriptsize
+\caption{Model cost at batch size 1, median over 300 runs. ``Ratio'' is $T{=}20$ time over single-pass
+time on the GPU. $^\ddagger$Includes the unused uncertainty modules of our head.
+Sub-10\,ms GPU differences should be read with caution, since desktop applications shared the GPU.}
+\label{tab:cost}
+\adjustbox{max width=\linewidth}{\input{tables/cost.tex}}
+\end{table}
+
+\subsection{Instance rescoring}
+
+Can the same score also raise COCO AP? Table~\ref{tab:rescoring} shows small AP changes. Exponential decay on spread gained
+\DapZsSimccMbvThreeExpAlphaDist{} and \DapZsSimccRFiveZeroExpAlphaDist{} AP points with ground-truth
+boxes, and \DapZsSimccMbvThreeDetExpAlphaDist{} and \DapZsSimccRFiveZeroDetExpAlphaDist{} with detector
+boxes, with fold standard deviations of similar size. Expected OKS changed AP by
+\DapZsSimccMbvThreeEoksDist{} and \DapZsSimccRFiveZeroEoksDist{} points with ground-truth boxes, and
+by \DapZsSimccMbvThreeDetEoksDist{} and \DapZsSimccRFiveZeroDetEoksDist{} with detector boxes. On the
+heatmap model, calibration selected $\alpha=\SelAlphaZsHmRFiveZero$ for both box types, meaning no
+rescoring. Spread-based rescoring is therefore not a
+meaningful source of AP on these models. Its value lies in identifying which keypoints to distrust.
+
+The fine-tuned \texttt{full} heads add two rules that use the learned outputs, expected OKS from
+$\sigma$ and the predicted OKS itself, with parameters again selected on val-cal. On ViPNAS-MobileNetV3
+neither helped: expected OKS from $\sigma$ changed AP by \DapFtMbvThreeFullSZeroEoksHet{} and
+\DapFtMbvThreeFullSZeroDetEoksHet{} points with ground-truth and detector boxes, and the predicted OKS by
+\DapFtMbvThreeFullSZeroPredOks{} $\pm$ \DapSdFtMbvThreeFullSZeroPredOks{} and
+\DapFtMbvThreeFullSZeroDetPredOks{} $\pm$ \DapSdFtMbvThreeFullSZeroDetPredOks{} (positive in
+\DapPosFtMbvThreeFullSZeroDetPredOks{} folds). On ResNet-50, expected OKS from $\sigma$ gained
+\DapFtRFiveZeroFullSZeroEoksHet{} $\pm$ \DapSdFtRFiveZeroFullSZeroEoksHet{} points with ground-truth boxes
+and \DapFtRFiveZeroFullSZeroDetEoksHet{} $\pm$ \DapSdFtRFiveZeroFullSZeroDetEoksHet{} with detector boxes
+(positive in \DapPosFtRFiveZeroFullSZeroDetEoksHet{} folds), the only rescoring gain in this study that
+clearly exceeds its fold SD. It comes from one training run, among several rules and models, so we treat
+it as a lead to test with more seeds and not as an established gain. It is also smaller than the AP that
+the head cost on the lightweight backbone.
+
+\begin{table}[t]
+\centering\scriptsize
+\caption{Instance rescoring on the test split, with parameters selected on the calibration split, for
+the pretrained SimCC models and the fine-tuned full heads (seed 0). All models use SimCC.
+$\Delta$AP is in percentage points, paired over 10 folds. Test AP differs from
+Table~\ref{tab:sanity} because it covers the test images only.}
+\label{tab:rescoring}
+\adjustbox{max width=\linewidth}{\input{tables/rescoring.tex}}
+\end{table}
+
+\subsection{Models trained from ImageNet weights}
+
+The published checkpoints were all trained by others. To check that \method{} does not depend on
+them, we trained two SimCC models ourselves from ImageNet weights with the 60-epoch schedule of
+Section~\ref{sec:arms}. The spread score again led: failure AUROC \FaImRThreeFourBaseSZeroDist{} on
+ResNet-34 and \FaImSocaBaseSZeroDist{} on SOCA-PRNet-34, against \FaImRThreeFourBaseSZeroConf{} and
+\FaImSocaBaseSZeroConf{} for the default peak confidence (Table~\ref{tab:soca}).
+
+The pair also gives a side result on the backbone itself, since SOCA-PRNet-34 is ResNet-34 with
+attention added. SOCA-PRNet-34 has \ParamsSocaBase{}\,M parameters against
+\ParamsRThreeFourBase{}\,M, with FLOPs unchanged at two decimals (\FlopsSocaBase{}\,G and \FlopsRThreeFourBase{}\,G). On
+val-test, AP with ground-truth boxes was \ApTestGtImSocaBaseSZero{} against \ApTestGtImRThreeFourBaseSZero{},
+a mean paired fold difference of \DapGtImSocaBaseSZero{} $\pm$ \DapSdGtImSocaBaseSZero{} points (positive in
+\DapPosGtImSocaBaseSZero{} folds). With detector boxes it was \DapDetImSocaBaseSZero{} $\pm$
+\DapSdDetImSocaBaseSZero{} (positive in \DapPosDetImSocaBaseSZero{} folds). The difference leans towards
+SOCA-PRNet, but each mean is smaller than its SD across folds, and with one training run per backbone the
+variation between runs is not measured. Our fine-tuning seeds give only a rough guide to that variation,
+since training from ImageNet weights for 60 epochs is a different setting. We therefore read this as a
+small possible gain, not an established one.
+
+\begin{table}[t]
+\centering\small
+\caption{ResNet-34 and SOCA-PRNet-34 with the same SimCC head, trained from ImageNet weights for 60
+epochs, one run each. AP is on val-test images. The shortened schedule means these values cannot be
+compared with published 210-epoch results.}
+\label{tab:soca}
+\adjustbox{max width=\linewidth}{\input{tables/soca.tex}}
+\end{table}
+
+\section{Discussion}
+
+\paragraph{Why the spread score beats head MC-Dropout} We offer explanations, but did not test them
+causally. The spread summarises ambiguity that the trained classifier has already learned to express:
+an occluded joint tends to produce a wide or multi-modal distribution. Head-only dropout, by contrast,
+perturbs a few layers around one fixed backbone feature, and a pretrained model was not fit under this
+perturbation. Training with the dropout active narrowed the gap but did not close it
+(Section~\ref{sec:headcmp}), which supports the training part of this account only partly. The remainder may reflect
+that head dropout around one fixed backbone feature does not reach the sources of error that matter,
+a possibility we did not test.
+
+\paragraph{Why the learned head did not help} Again we did not test the explanation. A SimCC head is
+already trained to put probability where the keypoint is, so its spread already carries much of what a
+separate $\sigma$ head is asked to learn, and $\sigma$ is fit to the same training errors. The learned
+outputs would then mostly restate the spread, which matches how close $\sigma$ came to it on every arm.
+The AP cost points to an interaction with the pose objective: the arm that added only
+$\mathcal{L}_{\text{het}}$ and $\mathcal{L}_{\text{cal}}$ carried most of the cost, and detaching the pose
+term inside $\mathcal{L}_{\text{het}}$ recovered most of it, though in a single exploratory run. The
+logged gradient norms stayed large with the detach, so the mechanism is not settled by our data.
+
+\paragraph{Using \method{} in practice} A deployed SimCC model already computes the logits \method{}
+needs, so adding it means a few lines of post-processing and one calibration pass over labelled images
+from the target setting (we used \numCalImages{}). The failure probability can flag keypoints for a downstream
+rule to ignore or for a human to check, and the conformal radius gives a tolerance in pixels that a
+safety argument can use. Two cautions apply. The coverage guarantee is marginal and holds only when
+deployment data resemble the calibration data, so the calibration set should come from the setting of
+use, and occluded joints were covered below the target in every case. On heatmap models the default
+score already performs comparably, so \method{} offers little there. These findings concern the models
+and metrics tested, and do not rule out that other methods, such as deep ensembles, would do better at
+a higher cost.
+
+\paragraph{Limitations} The keypoint-level results use two datasets, COCO and OCHuman, top-down models
+and ground-truth boxes, so detector errors are not reflected in them. On OCHuman the conformal bounds
+were calibrated on OCHuman's own val split; we did not test calibrating on one dataset and deploying
+on another, where the exchangeability behind the guarantee would not hold. MC-Dropout is limited to the head.
+We did not evaluate full-network dropout or ensembles, and the backbones were not trained with
+dropout. Only the control and the full head on ViPNAS-MobileNetV3 were trained with three seeds. Every
+other arm, ResNet-50 and the SOCA comparison are single runs, and all training schedules are short.
+COCO occlusion flags are annotator judgements. The test split is drawn from val2017, which
+is a public benchmark and may have influenced the published models. Figures quoted at the third decimal
+come from one split, though bootstrap intervals capture image sampling within it. Our detector differs
+from the one behind the published numbers.
+
+\section{Conclusion}
+
+\method{} gives a SimCC pose estimator calibrated keypoint failure probabilities and conformal error
+bounds without training, without added parameters and at a fraction of a millisecond per person. On
+five published SimCC-style models, including RTMPose, and on both COCO and the heavily occluded OCHuman
+dataset, it detected keypoint failures better than 20-pass head MC-Dropout, and its bounds kept their
+coverage while being tighter than a constant radius. It beat the default confidence at failure
+detection on the original SimCC models and matched it on RTMPose. It flagged occluded joints better than
+the default confidence on COCO but worse on OCHuman, where occlusion by other people may cause confident
+errors that no dispersion score can reveal. It held on models we trained ourselves. A trained uncertainty head, the costlier alternative, did not beat it: the learned
+$\sigma$ and OKS outputs ranked failures worse than \method{}'s score on the same fine-tuned model, on two
+backbones and, for the lightweight one, on three seeds, and the head cost about one AP point there.
+Instance rescoring with the score did not move AP meaningfully, and on a heatmap model \method{} offered
+little over the default score. For SimCC models we would therefore add \method{} first, and train an
+uncertainty head only where a measured gain justifies its parameters and its AP cost.
+
+\appendix
+\section{Defects found and fixed}\label{app:defects}
+
+We report these because each would have changed the results while the code still ran. Regression
+tests for them are in \texttt{tests/test\_core.py}.
+\begin{itemize}
+\item \textbf{Pretrained heatmap weights failed to load}: inserting dropout as its own layer shifted
+the deconvolution indices, so those weights were silently left random.
+\item \textbf{Resuming started from random weights}: \texttt{--resume auto} cleared the
+pretrained-checkpoint path even when no checkpoint existed to resume from.
+\item \textbf{The anatomical prior in the mixer was overwritten} by the framework's weight
+initialisation.
+\item \textbf{ECE was computed on raw logits}, not on probabilities, and on the same data used for
+fitting.
+\item \textbf{Ties in AUROC and risk-coverage} were ordered arbitrarily, which matters because argmax
+MC-Dropout often ties at zero.
+\item \textbf{Inconsistent units}: the residual used for calibration and the OKS target were not on
+the scale their formulas assumed. Unlabelled joints also received an OKS target.
+\end{itemize}
+
+\section*{Data and code availability}
+\pending{Repository URL. COCO is public. Result files regenerate every table, figure and inline
+number through \texttt{scripts/make\_paper\_assets.py}.}
+
+\section*{Declaration of competing interest}
+\pending{To be completed by the authors.}
+
+\bibliographystyle{elsarticle-num}
+\bibliography{references}
+
+\end{document}

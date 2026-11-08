@@ -16,7 +16,7 @@ sys.path.insert(0, str(PROJECT_ROOT / 'mmpose'))
 
 import ua_pose  # noqa: F401 - registers custom backbones, heads, losses, metrics
 from mmengine.config import Config, DictAction
-from mmengine.runner import Runner
+from mmengine.runner import Runner, find_latest_checkpoint
 
 
 def parse_args():
@@ -65,8 +65,11 @@ def main():
         cfg.optim_wrapper.type = 'AmpOptimWrapper'
 
     if args.resume == 'auto':
-        cfg.resume = True
-        cfg.load_from = None
+        # Clear load_from only when there is something to resume. Otherwise a first run
+        # of a fine-tune config would silently start from random weights.
+        if find_latest_checkpoint(cfg.work_dir) is not None:
+            cfg.resume = True
+            cfg.load_from = None
     elif args.resume is not None:
         cfg.resume = True
         cfg.load_from = args.resume

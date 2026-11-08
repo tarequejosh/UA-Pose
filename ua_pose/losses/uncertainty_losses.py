@@ -20,21 +20,26 @@ class HeteroscedasticKLLoss(nn.Module):
     """Heteroscedastic Discrete KL Divergence + Variance & OKS Calibration Loss.
 
     Extends SimCC's ``KLDiscretLoss`` (arXiv:2107.03332) with:
-    1. **Adaptive Variance-Conditioned Target Smoothing (RTMO / Dynamic-SimCC)**:
+    1. **Adaptive Variance-Conditioned Target Smoothing**:
        Optionally constructs dynamic 1D Gaussian soft targets whose width
        ``sigma_dyn = sigma_base * exp(0.5 * s_k)`` adapts to the network's
        predicted per-joint log-variance ``s_k``, preventing overconfident sharp
        supervision on occluded or ambiguous joints.
-    2. **Heteroscedastic NLL Attenuation (Kendall & Gal, CVPR 2017)**:
+    2. **Heteroscedastic NLL Attenuation (Kendall & Gal, NeurIPS 2017)**:
        ``L_het = 0.5 * exp(-s_x) * D_x + 0.5 * s_x + 0.5 * exp(-s_y) * D_y + 0.5 * s_y``
     3. **Direct Laplace Coordinate Residual Calibration**:
-       Forces ``exp(0.5 * s_k)`` to track the detached sub-pixel L1 error
-       ``|hat_mu_k - mu_gt_k|``.
-    4. **OKS Confidence Calibration Loss (inspired by Gu et al., ICML 2024)**:
-       Supervises the predicted OKS/visibility logit ``vis_logits`` directly
-       against the true per-joint Object Keypoint Similarity
-       ``OKS_k = exp(-d_k^2 / (2 * s_box^2 * kappa_k^2))`` so that keypoint
-       confidence is strictly aligned with the COCO AP evaluation metric.
+       Forces ``exp(0.5 * s_k)`` to track the detached residual of the decoded
+       (argmax) coordinate.
+    4. **OKS Confidence Loss (inspired by Gu et al., ICML 2024)**:
+       Supervises a logit against the true per-joint COCO similarity
+       ``OKS_k = exp(-d_k^2 / (2 * A * (2 * kappa_k)^2))``, labelled joints only.
+
+    Units: ``s_k`` is the log-variance in units of ``base_sigma`` bins, i.e. residuals
+    are divided by ``sigma_0`` before use. This is what makes terms 1-3 consistent: for
+    Gaussian targets with equal width, the summed KL is ``e^2 / 2`` with ``e`` the offset
+    in sigma_0 units, so the attenuation optimum ``s = log(e^2 / 2)`` and the Laplace
+    optimum ``s = 2 log(e)`` agree up to a constant, and ``exp(0.5 * s)`` is directly a
+    multiplier of ``sigma_0`` for the adaptive target.
 
     Args:
         beta (float): Temperature factor for SimCC Softmax. Defaults to 1.0.
@@ -52,6 +57,14 @@ class HeteroscedasticKLLoss(nn.Module):
             Defaults to 0.2.
         vis_weight (float): Weight for OKS-aligned confidence/visibility loss.
             Defaults to 0.2.
+        simcc_split_ratio (float): Bins per input pixel. Defaults to 2.0.
+        oks_area_px (float): COCO segment area in input-crop pixels^2, used as ``A`` in
+            the OKS target. The default is the COCO train2017 median measured by
+            ``scripts/compute_oks_area.py`` for 256x192 crops.
+        detach_kl_in_het (bool): Stop the attenuation term's gradient into the pose
+            distribution, so ``exp(-s) * D`` trains ``s`` only. Without this, ``exp(-s)``
+            multiplies the pose gradient by hundreds on accurate joints. Defaults to False,
+            the original Kendall & Gal form.
     """
 
     def __init__(
@@ -65,8 +78,14 @@ class HeteroscedasticKLLoss(nn.Module):
         het_weight: float = 0.5,
         cal_weight: float = 0.2,
         vis_weight: float = 0.2,
+        simcc_split_ratio: float = 2.0,
+        oks_area_px: float = 9850.0,
+        detach_kl_in_het: bool = False,
     ) -> None:
         super().__init__()
+        self.detach_kl_in_het = detach_kl_in_het
+        self.simcc_split_ratio = simcc_split_ratio
+        self.oks_area_px = oks_area_px
         self.beta = beta
         self.label_softmax = label_softmax
         self.label_beta = label_beta
@@ -118,18 +137,6 @@ class HeteroscedasticKLLoss(nn.Module):
         norm = sigma * np.sqrt(2.0 * np.pi)
         return target / (norm + 1e-8)
 
-    @staticmethod
-    def _expected_coord(logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute soft-argmax expected bin coordinate and distribution std."""
-        probs = F.softmax(logits, dim=-1)
-        num_bins = logits.size(-1)
-        grid = torch.linspace(
-            0.0, 1.0, num_bins, device=logits.device, dtype=logits.dtype)
-        mean_coord = torch.sum(probs * grid, dim=-1)  # [N, K]
-        var_coord = torch.sum(
-            probs * (grid - mean_coord.unsqueeze(-1))**2, dim=-1)
-        return mean_coord, torch.sqrt(var_coord + 1e-6)
-
     def forward(
         self,
         pred_simcc: Tuple[torch.Tensor, torch.Tensor],
@@ -149,8 +156,8 @@ class HeteroscedasticKLLoss(nn.Module):
             weight = torch.ones((n, k), device=pred_x.device, dtype=pred_x.dtype)
 
         if log_var is not None:
-            s_x = torch.clamp(log_var[..., 0], min=-6.0, max=4.0)
-            s_y = torch.clamp(log_var[..., 1], min=-6.0, max=4.0)
+            s_x = torch.clamp(log_var[..., 0], min=-8.0, max=6.0)
+            s_y = torch.clamp(log_var[..., 1], min=-8.0, max=6.0)
         else:
             s_x = None
             s_y = None
@@ -169,19 +176,23 @@ class HeteroscedasticKLLoss(nn.Module):
         base_loss = ((kl_x + kl_y) * weight).sum() / k
         losses = dict(loss_kpt=base_loss)
 
-        pred_mu_x, _ = self._expected_coord(pred_x)
-        pred_mu_y, _ = self._expected_coord(pred_y)
-        gt_mu_x = torch.argmax(gt_x, dim=-1).float() / max(gt_x.size(-1) - 1, 1)
-        gt_mu_y = torch.argmax(gt_y, dim=-1).float() / max(gt_y.size(-1) - 1, 1)
-
-        err_x = torch.abs(pred_mu_x.detach() - gt_mu_x).clamp(min=1e-4)
-        err_y = torch.abs(pred_mu_y.detach() - gt_mu_y).clamp(min=1e-4)
+        # Residual of the coordinate that is actually decoded at inference, in bins.
+        bins_x = torch.abs(
+            torch.argmax(pred_x.detach(), dim=-1) - torch.argmax(gt_x, dim=-1)).float()
+        bins_y = torch.abs(
+            torch.argmax(pred_y.detach(), dim=-1) - torch.argmax(gt_y, dim=-1)).float()
+        # Half a bin is the quantisation limit of the decoded coordinate.
+        err_x = (bins_x / self.base_sigma).clamp(min=0.5 / self.base_sigma)
+        err_y = (bins_y / self.base_sigma).clamp(min=0.5 / self.base_sigma)
 
         if s_x is not None and s_y is not None:
             # 1. Heteroscedastic KL attenuation loss
             d_x = kl_x * pred_x.size(-1)
             d_y = kl_y * pred_y.size(-1)
-            het_x = 0.5 * torch.exp(-s_x) * d_x + 0.5 * s_x
+            if self.detach_kl_in_het:
+                d_x = d_x.detach()
+                d_y = d_y.detach()
+            het_x =0.5 * torch.exp(-s_x) * d_x + 0.5 * s_x
             het_y = 0.5 * torch.exp(-s_y) * d_y + 0.5 * s_y
             loss_het = ((het_x + het_y) * weight).mean() * self.het_weight
 
@@ -197,18 +208,21 @@ class HeteroscedasticKLLoss(nn.Module):
             losses['loss_cal'] = loss_cal
 
         if vis_logits is not None:
-            # 3. OKS-Aligned Confidence Calibration Loss (Gu et al., ICML 2024)
-            # Compute per-joint OKS in normalized crop coordinates
-            sq_dist = err_x**2 + err_y**2
+            # 3. OKS-aligned confidence (Gu et al., ICML 2024), COCO definition:
+            # OKS_k = exp(-d^2 / (2 * A * (2 * kappa)^2)), d and A in input pixels.
+            # Unlabelled joints have no location, so they get no OKS target at all.
+            sq_dist = (bins_x**2 + bins_y**2) / (self.simcc_split_ratio**2)
             if k == len(COCO_OKS_SIGMAS):
                 kappa = self.oks_sigmas.to(pred_x.device).view(1, k)
             else:
                 kappa = torch.full((1, k), 0.05, device=pred_x.device)
-            # In normalized [0, 1] person box space, box area s^2 ~ 0.53
-            oks_target = torch.exp(-sq_dist / (2.0 * 0.53 * (kappa**2))) * (weight > 0).float()
-            loss_vis = F.binary_cross_entropy_with_logits(
-                vis_logits, oks_target.detach()) * self.vis_weight
-            losses['loss_oks_cal'] = loss_vis
+            oks_target = torch.exp(
+                -sq_dist / (2.0 * self.oks_area_px * (2.0 * kappa)**2))
+            mask = (weight > 0).float()
+            bce = F.binary_cross_entropy_with_logits(
+                vis_logits, oks_target.detach(), reduction='none')
+            losses['loss_oks_cal'] = (
+                (bce * mask).sum() / mask.sum().clamp(min=1.0)) * self.vis_weight
 
         return losses
 
@@ -289,8 +303,8 @@ class HeteroscedasticHeatmapLoss(nn.Module):
         losses = dict(loss_kpt=base_loss)
 
         if log_var is not None:
-            s_x = torch.clamp(log_var[..., 0], min=-6.0, max=4.0)
-            s_y = torch.clamp(log_var[..., 1], min=-6.0, max=4.0)
+            s_x = torch.clamp(log_var[..., 0], min=-8.0, max=6.0)
+            s_y = torch.clamp(log_var[..., 1], min=-8.0, max=6.0)
             s_joint = 0.5 * (s_x + s_y)
 
             # 1. Heteroscedastic MSE attenuation
@@ -303,8 +317,10 @@ class HeteroscedasticHeatmapLoss(nn.Module):
             pred_coords, _ = self._heatmap_soft_argmax(pred_hm.detach())
             gt_coords, _ = self._heatmap_soft_argmax(gt_hm.detach(), beta=50.0)
 
-            err_x = torch.abs(pred_coords[..., 0] - gt_coords[..., 0]).clamp(min=1e-4)
-            err_y = torch.abs(pred_coords[..., 1] - gt_coords[..., 1]).clamp(min=1e-4)
+            # Residuals in heatmap cells rather than [0, 1], so s_k stays in the range
+            # the clamp above allows instead of saturating for accurate joints.
+            err_x = (torch.abs(pred_coords[..., 0] - gt_coords[..., 0]) * (w - 1)).clamp(min=0.1)
+            err_y = (torch.abs(pred_coords[..., 1] - gt_coords[..., 1]) * (h - 1)).clamp(min=0.1)
 
             sigma_x = torch.exp(0.5 * s_x)
             sigma_y = torch.exp(0.5 * s_y)

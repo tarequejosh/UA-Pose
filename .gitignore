@@ -22,6 +22,20 @@ work_dirs/
 *.ckpt
 *.zip
 
+# Local run logs (machine-specific paths; results are regenerated from work_dirs)
+logs/
+
+# LaTeX build files
+paper/*.aux
+paper/*.log
+paper/*.bbl
+paper/*.blg
+paper/*.out
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+paper/*.spl
+
 # OS & IDE files
 .DS_Store
 Thumbs.db

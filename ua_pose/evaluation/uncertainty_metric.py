@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 from mmengine.evaluator import BaseMetric
 from mmengine.logging import MMLogger
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import pearsonr, rankdata, spearmanr
 
 from mmpose.registry import METRICS
 
@@ -35,10 +35,10 @@ def compute_auroc(scores: np.ndarray, binary_labels: np.ndarray) -> float:
     if n_pos == 0 or n_neg == 0:
         return 0.5
 
-    # Mann-Whitney U statistic via ranks
-    order = np.argsort(scores)
-    ranks = np.empty_like(order, dtype=np.float64)
-    ranks[order] = np.arange(1, len(scores) + 1, dtype=np.float64)
+    # Mann-Whitney U statistic with average ranks, so tied scores count as 0.5. Ordinal
+    # ranks would let the sort order decide ties, which matters for discrete signals
+    # such as argmax MC-Dropout where many keypoints have exactly zero spread.
+    ranks = rankdata(scores, method='average')
     auc = (np.sum(ranks[pos_mask]) - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
     return float(auc)
 
@@ -58,6 +58,8 @@ def compute_ece(
     n = len(confidences)
     if n == 0:
         return 0.0
+    # Inputs must already be probabilities. Raw SimCC scores are logits and need a
+    # fitted mapping first (see scripts/analyze_results.py); clipping them is not one.
     conf = np.clip(confidences, 0.0, 1.0)
     bins = np.linspace(0.0, 1.0, num_bins + 1)
     ece = 0.0
@@ -97,8 +99,10 @@ def compute_risk_coverage_and_ause(
             ause_pck=0.0,
         )
 
-    # Sort ascending by uncertainty (most confident first)
-    unc_order = np.argsort(uncertainties)
+    # Sort ascending by uncertainty (most confident first). Ties are broken by a fixed
+    # random key: stable order would leak dataset order into the curve.
+    tie_break = np.random.default_rng(0).random(n)
+    unc_order = np.lexsort((tie_break, uncertainties))
     # Oracle sorts ascending by true error
     oracle_order = np.argsort(errors)
 
@@ -324,12 +328,8 @@ class UncertaintyPoseMetric(BaseMetric):
         else:
             quintile_errors = [0.0] * 5
 
-        # 6. Expected Calibration Error (ECE) before & after Uncertainty Calibration
-        is_correct = (errors < self.pck_threshold).astype(np.float64)
-        norm_unc = unc / max(float(np.mean(unc)), 1e-8)
-        calibrated_conf = np.clip(scores * np.exp(-0.3 * norm_unc), 0.0, 1.0)
-        ece_base = compute_ece(scores, is_correct)
-        ece_cal = compute_ece(calibrated_conf, is_correct)
+        # ECE is deliberately not logged here: SimCC scores are logits, so it needs a
+        # mapping fitted on held-out data. See scripts/analyze_results.py.
 
         metrics = dict(
             num_keypoints=n_total,
@@ -353,8 +353,6 @@ class UncertaintyPoseMetric(BaseMetric):
             AUSE_err_baseline=rc_base['ause_err'],
             AUSE_pck_unc=rc_unc['ause_pck'],
             AUSE_pck_baseline=rc_base['ause_pck'],
-            ECE_baseline=ece_base,
-            ECE_calibrated=ece_cal,
             quintile_1_err=quintile_errors[0],
             quintile_3_err=quintile_errors[2],
             quintile_5_err=quintile_errors[4],
@@ -368,7 +366,6 @@ class UncertaintyPoseMetric(BaseMetric):
             f'  Occ/Vis Unc Ratio   : {occ_vis_ratio:.2f}x (Occ AUROC: {occ_auroc_unc:.3f} vs Base {occ_auroc_base:.3f})\n'
             f'  Spearman rho (Err)  : Combined={rho_unc:.4f} | Het={rho_het:.4f} | DistStd={rho_dist:.4f} | BaseConf={rho_base:.4f}\n'
             f'  AUSE (PCK@0.1)      : Unc={rc_unc["ause_pck"]:.4f} vs BaseConf={rc_base["ause_pck"]:.4f} (lower is better)\n'
-            f'  Calibration ECE     : Calibrated={ece_cal:.4f} vs BaseConf={ece_base:.4f} (lower is better)\n'
             f'  Quintile Error      : Q1(confident)={quintile_errors[0]:.4f} -> Q5(uncertain)={quintile_errors[4]:.4f}\n'
             f'==================================================================='
         )

@@ -1,14 +1,19 @@
-# Core scientific & OpenMMLab packages for UA-PoseEstimation
-# Note: On Windows with NVIDIA RTX 5060, run `setup_windows_rtx5060.ps1` first
-# so PyTorch is installed with CUDA 12.8 (`--index-url https://download.pytorch.org/whl/cu128`).
-mmengine>=0.10.0
-mmcv>=2.0.0,<2.2.0
-numpy>=1.24.0,<2.0.0
+# Verified working stack for an RTX 5060 (sm_120 needs CUDA 12.8) on Windows 11, Python 3.12.
+# Install PyTorch first, from its own index:
+#   pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+#
+# mmcv-lite: no compiled mmcv wheels exist for this PyTorch. pycocotools stands in for
+# xtcocotools, which has no Python 3.12 Windows wheel. See ua_pose/compat.py for both.
+numpy<2
+opencv-python<4.12
+mmengine==0.10.7
+mmcv-lite==2.2.0
+pycocotools>=2.0.8
 scipy>=1.10.0
 matplotlib>=3.7.0
-opencv-python>=4.7.0
 pillow>=9.5.0
 tqdm>=4.65.0
 json_tricks>=3.16.0
 munkres>=1.1.4
-xtcocotools>=1.13
+six
+pytest

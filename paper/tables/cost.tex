@@ -1,0 +1,19 @@
+\begin{tabular}{lrrrrrrr}
+\toprule
+& Params & FLOPs & \multicolumn{2}{c}{GPU (ms)} & & \multicolumn{2}{c}{CPU, 1 thread (ms)} \\
+Model & (M) & (G) & 1 pass & $T{=}20$ & Ratio & 1 pass & $T{=}20$ \\
+\midrule
+ViPNAS-MBV3, plain SimCC & 8.65 & 0.80 & 10.7 & -- & -- & 49 & -- \\
+ViPNAS-MBV3, + $\sigma$/OKS head & 9.06 & 0.80 & 10.2 & 27.8 & 2.7$\times$ & 50 & 107 \\
+ViPNAS-MBV3, + token mixer & 9.62 & 0.82 & 12.6 & 41.8 & 3.3$\times$ & 50 & 128 \\
+ResNet-50, plain SimCC & 36.75 & 5.50 & 4.9 & -- & -- & 123 & -- \\
+ResNet-50, + $\sigma$/OKS head & 37.16 & 5.50 & 5.5 & 21.9 & 4.0$\times$ & 122 & 854 \\
+ResNet-50, + token mixer & 37.72 & 5.51 & 8.1 & 39.8 & 4.9$\times$ & 123 & 906 \\
+ResNet-34, SimCC$^{\ddagger}$ & 28.65 & 4.77 & 5.0 & 20.6 & 4.1$\times$ & 98 & 607 \\
+SOCA-PRNet-34, SimCC$^{\ddagger}$ & 28.95 & 4.77 & 6.9 & 23.9 & 3.5$\times$ & 101 & 606 \\
+ResNet-50, heatmap$^{\ddagger}$ & 34.30 & 5.45 & 5.4 & 28.0 & 5.2$\times$ & 138 & 1235 \\
+RTMPose-t & 3.34 & 0.36 & 4.6 & 25.8 & 5.6$\times$ & 14 & 38 \\
+RTMPose-s & 5.47 & 0.68 & 4.9 & 25.6 & 5.3$\times$ & 21 & 46 \\
+RTMPose-m & 13.59 & 1.93 & 6.7 & 30.6 & 4.5$\times$ & 46 & 78 \\
+\bottomrule
+\end{tabular}

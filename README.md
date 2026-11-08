@@ -1,108 +1,97 @@
-# Uncertainty-Aware Lightweight Pose Estimation (`UA-PoseEstimation`)
+# SpreadCP: Training-Free Keypoint Uncertainty for Lightweight Pose Estimation
 
-A complete research framework built on **[OpenMMLab MMPose](https://github.com/open-mmlab/mmpose)** for **Uncertainty-Aware Lightweight 2D Human Pose Estimation**, tailored to run out-of-the-box on **Windows 11 (NVIDIA RTX 5060 + Intel Core Ultra i7)**.
+Code, configs and manuscript for **SpreadCP**, a training-free uncertainty module for
+coordinate-classification (SimCC-style) pose estimators, built on
+[OpenMMLab MMPose](https://github.com/open-mmlab/mmpose).
 
----
+SpreadCP reads the spread of the 1D coordinate distributions a SimCC head already outputs, maps it to a
+calibrated keypoint failure probability (Platt scaling), and uses it to scale split-conformal error
+bounds per keypoint. It adds no parameters and no training, and about 0.06 ms per person on one CPU
+thread.
 
-## 1. Research Overview & Architecture
+The manuscript is in [`paper/main.pdf`](paper/main.pdf); every number in it is generated from result
+files by [`scripts/make_paper_assets.py`](scripts/make_paper_assets.py). The evaluation plan and every
+later change to it are logged in [`paper/ANALYSIS_PLAN.md`](paper/ANALYSIS_PLAN.md).
 
-Building on preliminary findings with training-free MC-Dropout on Keypoint R-CNN (where 20 stochastic head passes showed **$2.55\times$ higher uncertainty on occluded joints** and **Spearman $\rho = 0.670$** correlation with localization error), this repository extends lightweight pose estimators (`PoseResNet`, `SOCA-PRNet`, and `ViPNAS-MobileNetV3`) with **single-pass and multi-pass uncertainty quantification** inspired by:
+## What the experiments show
 
-1. **[SimCC: a Simple Coordinate Classification Perspective for Human Pose Estimation](https://arxiv.org/pdf/2107.03332) (`arXiv:2107.03332`)**:
-   - Replaces heavy 2D deconvolutional heatmaps with 1D sub-pixel coordinate classification vectors ($x, y$).
-   - **Intrinsic Distributional Uncertainty (`dist_std` & `entropy`)**: Extracts the sub-pixel variance and Shannon entropy of the 1D coordinate distributions in a **single forward pass at zero extra compute**.
-   - **Trained Heteroscedastic SimCC Head (`UASimCCHead` + `HeteroscedasticKLLoss`)**: Predicts per-joint log-variance $(s_{x,k}, s_{y,k})$ and visibility probability $\hat{v}_k$, trained with heteroscedastic KL attenuation and Laplace coordinate residual calibration.
-2. **[Human Pose as Compositional Tokens (PCT)](https://arxiv.org/pdf/2303.11638) (`arXiv:2303.11638`)**:
-   - **Compositional Sub-Structure Token Mixer (`CompositionalTokenMixer`)**: Instead of predicting joint coordinates and uncertainties in isolation, projects the $K=17$ joints into $M=8$ compositional sub-structure tokens, models cross-limb anatomical dependencies via multi-head self-attention, and decodes structural context back into each joint before predicting coordinates and uncertainty.
-3. **SOCA-PRNet Backbone (`SOCAPRNet`)**:
-   - Extends `PoseResNet-34` with **Global Context Blocks (GCB)** and **Spatially Oriented Contextual Attention (SOCA)** across residual stages while remaining 100% weight-compatible with `torchvision://resnet34`.
-4. **Uncertainty-Aware Heatmap Head (`UAHeatmapHead`)**:
-   - Extends `HeatmapHead` (`PoseResNet-50` / `SOCA-PRNet-34`) with both a single-pass heteroscedastic variance branch, 2D soft-argmax spatial spread, and `Dropout2d(p=0.1)` after every deconv ReLU layer to allow direct **20-pass MC-Dropout** comparison on the exact same backbone.
+All metrics are on held-out test images; every fitted quantity (Platt, fusion, conformal quantile,
+rescoring parameters) uses a separate calibration split.
 
----
+| Finding | Where it holds |
+|---|---|
+| Spread score detects keypoint failures better than 20-pass head MC-Dropout | All 5 SimCC-style models, COCO and OCHuman, every dropout rate tested |
+| Spread-scaled conformal bounds keep 90% coverage with a smaller radius than a constant radius | All 5 SimCC-style models, COCO and OCHuman |
+| Beats the model's default confidence at failure detection | Original SimCC models; **only matches** it on RTMPose |
+| Flags occluded joints better than the default confidence | COCO; **reverses** on OCHuman |
+| A trained uncertainty head (heteroscedastic + calibration + OKS terms, token mixer, adaptive target) beats the spread score | **No**: worse on two backbones, three seeds, and about 1 AP point lower on ViPNAS-MobileNetV3 |
+| Uncertainty-based instance rescoring raises AP meaningfully | **No** |
+| Works on heatmap models | **No**: the default confidence is as good, and conformal radius grows |
 
-## 2. Repository Structure
+Models: SimCC with ViPNAS-MobileNetV3 and ResNet-50, RTMPose-t/s/m, a SimpleBaseline ResNet-50 heatmap
+model, plus ResNet-34 and SOCA-PRNet-34 trained from ImageNet weights. Datasets: COCO val2017 (seeded
+30/70 calibration/test split) and OCHuman (official val/test).
+
+## Repository layout
 
 ```text
-UA-PoseEstimation/
-├── mmpose/                         # Bundled OpenMMLab MMPose framework
-├── ua_pose/                        # Custom Uncertainty-Aware MMPose plugin package
-│   ├── backbones/
-│   │   └── soca_prnet.py           # SOCAPRNet, GlobalContextBlock, SOCA module
-│   ├── heads/
-│   │   ├── ua_simcc_head.py        # UASimCCHead + PCT CompositionalTokenMixer
-│   │   └── ua_heatmap_head.py      # UAHeatmapHead (Heteroscedastic + Deconv Dropout2d)
-│   ├── losses/
-│   │   └── uncertainty_losses.py   # HeteroscedasticKLLoss & HeteroscedasticHeatmapLoss
-│   └── evaluation/
-│       └── uncertainty_metric.py   # UncertaintyPoseMetric (PCK@0.1, Spearman rho, AUSE, AUROC)
-├── configs/
-│   ├── simcc/
-│   │   ├── ua_simcc_soca_prnet34_coco_256x192.py
-│   │   ├── ua_simcc_res34_coco_256x192.py
-│   │   ├── ua_simcc_res50_coco_256x192.py
-│   │   ├── ua_simcc_res50_finetune_20e_coco_256x192.py
-│   │   ├── ua_simcc_vipnas_mbv3_coco_256x192.py
-│   │   └── ua_simcc_vipnas_mbv3_finetune_20e_coco_256x192.py
-│   └── heatmap/
-│       ├── ua_heatmap_soca_prnet34_coco_256x192.py
-│       ├── ua_heatmap_res50_coco_256x192.py
-│       └── ua_heatmap_res50_finetune_20e_coco_256x192.py
-├── scripts/
-│   ├── download_coco_and_weights.py  # Downloads COCO 2017 & pretrained SimCC/Heatmap weights
-│   ├── evaluate_uncertainty_coco.py  # Evaluates on 500 COCO val2017 images & plots Figures 1, 2, 3
-│   └── train.py                      # Single-GPU AMP training / fine-tuning launcher
-├── tests/
-│   └── smoke_test.py                 # Verifies RTX 5060 CUDA, models, losses, and metrics
-├── setup_windows_rtx5060.ps1         # Automated Windows 11 + RTX 5060 (CUDA 12.8) installer
-└── run_experiments_windows.bat       # One-click Windows batch runner for all experiments
+ua_pose/                 MMPose plugin
+  heads/ua_simcc_head.py   SimCC head with all per-keypoint signals and the trained uncertainty head
+  heads/ua_rtmcc_head.py   RTMPose head wrapper with the same signals (no trained parameters)
+  heads/ua_heatmap_head.py Heatmap head with spatial spread and head MC-Dropout
+  backbones/soca_prnet.py  SOCA-PRNet backbone
+  losses/                  Heteroscedastic, calibration and OKS losses
+  evaluation/analysis.py   Split, AUROC, AUSE, ECE, conformal and bootstrap utilities
+configs/                 SimCC, heatmap and RTMPose configs
+scripts/
+  run_experiments.py       Resumable queue: zero-shot dumps, fine-tuning arms, seeds, SOCA, cost
+  evaluate_uncertainty_coco.py  Dump predictions and every signal for a model on a COCO-format set
+  analyze_results.py       Keypoint-level metrics with paired bootstrap intervals
+  score_all.py             Runs analyze_results.py on every dump with the right learned-signal flags
+  ap_sanity.py, arm_ap.py, rescore_ap.py  AP reproduction, paired fold AP differences, rescoring
+  measure_cost.py, measure_method_overhead.py  Parameters, FLOPs, latency
+  prepare_ochuman.py       Merges OCHuman val/test and writes the official split file
+  make_paper_assets.py     Tables, figures and LaTeX macros for the paper
+paper/                   Manuscript, analysis plan, generated tables and figures
+tests/test_core.py       Regression tests for defects found during the study
 ```
 
----
+## Reproducing
 
-## 3. Quick Start on Windows 11 (NVIDIA RTX 5060 + Core Ultra i7)
+Datasets, checkpoints and results are not in the repository (`data/`, `checkpoints/`, `work_dirs/`
+are ignored).
 
-### Step 1: Clone & Run the Automated Windows Installer
-Open **PowerShell** or **Anaconda PowerShell Prompt** on your Windows PC:
-
-```powershell
-git clone <YOUR_GITHUB_REPO_URL> UA-PoseEstimation
-cd UA-PoseEstimation
-
-# Creates 'ua-pose' environment, installs PyTorch (CUDA 12.8 for RTX 5060 Blackwell),
-# installs MMEngine/MMCV/MMPose, and runs tests\smoke_test.py
+```bash
+# Environment (Windows + CUDA 12.8 helper; see requirements.txt for packages)
 powershell -ExecutionPolicy Bypass -File .\setup_windows_rtx5060.ps1
+
+# COCO 2017 and the published SimCC / heatmap checkpoints
+python scripts/download_coco_and_weights.py --include-train2017
+
+# Experiments (resumable; each step is skipped once its output exists)
+python scripts/run_experiments.py --stages zeroshot cost finetune_core ablation seeds soca
+
+# Keypoint metrics (1000 bootstrap resamples), AP checks and rescoring
+python scripts/score_all.py --num-boot 1000
+python scripts/ap_sanity.py <tags>
+python scripts/rescore_ap.py --tags <tags>
+
+# OCHuman (download from the official OCHuman site into data/OCHuman first)
+python scripts/prepare_ochuman.py
+python scripts/analyze_results.py --dump-dir work_dirs/dumps_ochuman --out-dir work_dirs/results_ochuman \
+    --ann data/OCHuman/annotations/ochuman_val_test_merged.json \
+    --split-file data/OCHuman/annotations/ochuman_split.json --tags och_simcc_mbv3 ...
+
+# Paper assets and PDF
+python scripts/make_paper_assets.py
+cd paper && pdflatex main && bibtex main && pdflatex main && pdflatex main
 ```
 
-### Step 2: Download Pretrained Checkpoints & COCO 2017 Dataset
-```cmd
-conda activate ua-pose
+RTMPose checkpoints are the published MMPose COCO weights (`rtmpose-{tiny,s,m}_simcc-coco_pt-aic-coco_420e-256x192`);
+the paper reports that they reproduce the published AP to within 0.2 points.
 
-REM Download pretrained SimCC/Heatmap checkpoints + COCO val2017 (~1 GB)
-python scripts\download_coco_and_weights.py
+## Tests
 
-REM If you also need COCO train2017 (~18 GB) for training/fine-tuning:
-python scripts\download_coco_and_weights.py --include-train2017
-```
-
-### Step 3: Run the 500-Image COCO Uncertainty Benchmark & Generate Figures 1, 2, 3
-To immediately evaluate **SimCC (`ResNet-50` & `ViPNAS-MobileNetV3`)** and **PoseResNet Heatmap (`ResNet-50`)** on 500 randomly sampled COCO val2017 images (comparing Peak Confidence, Single-Pass 1D/2D Distribution Spread, Entropy, and 20-Pass MC-Dropout):
-
-```cmd
-.\run_experiments_windows.bat eval
-```
-
-This outputs:
-- `work_dirs\eval_simcc_res50_500imgs\uncertainty_summary.json`
-- `work_dirs\eval_simcc_res50_500imgs\figure1_predicted_skeletons_uncertainty.png`
-- `work_dirs\eval_simcc_res50_500imgs\figure2_occlusion_and_pck_curves.png`
-- `work_dirs\eval_simcc_res50_500imgs\figure3_quintiles_and_error_correlation.png`
-
-### Step 4: Fine-Tune or Train Uncertainty-Aware Heads (Single-Pass Heteroscedastic + PCT Tokens)
-```cmd
-REM Fast 20-epoch fine-tuning from COCO-pretrained SimCC checkpoints (uses AMP fp16 on RTX 5060):
-.\run_experiments_windows.bat finetune
-
-REM Or train SOCA-PRNet-34 + UA-SimCCHead + PCT Compositional Tokens from scratch:
-.\run_experiments_windows.bat train_soca
+```bash
+python -m pytest tests/test_core.py -q
 ```

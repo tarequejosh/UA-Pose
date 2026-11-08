@@ -123,10 +123,10 @@ class CompositionalTokenMixer(nn.Module):
                 self.to_tokens.weight.copy_(prior + 0.02 * torch.randn_like(prior))
                 self.from_tokens.weight.copy_(
                     prior.t() + 0.02 * torch.randn_like(prior.t()))
-        # Initialize output projection near zero so pretrained SimCC models
-        # preserve 100% of their zero-shot accuracy before fine-tuning
-        nn.init.normal_(self.hidden_to_joint[0].weight, std=1e-3)
-        nn.init.constant_(self.hidden_to_joint[0].bias, 0.0)
+        # Zero-init the residual output so the mixer is an exact identity at the
+        # start: a pretrained SimCC model keeps its accuracy until training moves it.
+        nn.init.zeros_(self.hidden_to_joint[0].weight)
+        nn.init.zeros_(self.hidden_to_joint[0].bias)
 
     def forward(
         self, x: Tensor
@@ -282,6 +282,17 @@ class UASimCCHead(SimCCHead):
             nn.Linear(unc_in_dim // 2, 3),
         )
 
+    def init_weights(self) -> None:
+        """Initialise, then restore the mixer's anatomical prior.
+
+        ``SimCCHead.default_init_cfg`` applies Normal(0, 0.01) to every ``Linear`` in the
+        head, including the mixer. Without this override the K-to-M routing prior and
+        the zero-init residual are silently destroyed as soon as a Runner starts.
+        """
+        super().init_weights()
+        if self.token_mixer is not None:
+            self.token_mixer._init_anatomical_priors()
+
     def _extract_head_features(self, feats: Tuple[Tensor]) -> Tensor:
         """Run deconv / final_layer to get [B, K, H_hm, W_hm] then flatten."""
         if self.deconv_head is None:
@@ -322,26 +333,29 @@ class UASimCCHead(SimCCHead):
 
     @staticmethod
     def compute_simcc_distribution_metrics(
-        pred_x: Tensor, pred_y: Tensor
-    ) -> Tuple[Tensor, Tensor]:
-        """Compute 1D SimCC distributional standard deviation and entropy.
+        pred_x: Tensor, pred_y: Tensor, simcc_split_ratio: float = 2.0
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Compute 1D SimCC distributional spread, entropy and peak probability.
 
         Args:
             pred_x (Tensor): Logits along x-axis [B, K, W].
             pred_y (Tensor): Logits along y-axis [B, K, H].
+            simcc_split_ratio (float): Bins per input pixel, used so that both axes
+                share one unit. Defaults to 2.0.
 
         Returns:
-            Tuple[Tensor, Tensor]:
-                - dist_std: Normalized sub-pixel distribution std [B, K]
-                - dist_entropy: Normalized Shannon entropy [B, K]
+            Tuple[Tensor, Tensor, Tensor]:
+                - dist_std: Distribution std in input pixels [B, K]
+                - dist_entropy: Normalized Shannon entropy in [0, 1] [B, K]
+                - peak_prob: min(max p_x, max p_y) [B, K]
         """
         px = F.softmax(pred_x, dim=-1)
         py = F.softmax(pred_y, dim=-1)
 
         w = pred_x.size(-1)
         h = pred_y.size(-1)
-        grid_x = torch.linspace(0.0, 1.0, w, device=pred_x.device, dtype=pred_x.dtype)
-        grid_y = torch.linspace(0.0, 1.0, h, device=pred_y.device, dtype=pred_y.dtype)
+        grid_x = torch.arange(w, device=pred_x.device, dtype=pred_x.dtype) / simcc_split_ratio
+        grid_y = torch.arange(h, device=pred_y.device, dtype=pred_y.dtype) / simcc_split_ratio
 
         mu_x = torch.sum(px * grid_x, dim=-1, keepdim=True)
         mu_y = torch.sum(py * grid_y, dim=-1, keepdim=True)
@@ -355,13 +369,27 @@ class UASimCCHead(SimCCHead):
         ent_y = -torch.sum(py * torch.log(py + 1e-12), dim=-1) / np.log(h)
         dist_entropy = 0.5 * (ent_x + ent_y)
 
-        return dist_std, dist_entropy
+        peak_prob = torch.minimum(px.amax(dim=-1), py.amax(dim=-1))
+
+        return dist_std, dist_entropy, peak_prob
 
     def _enable_mc_dropout(self) -> None:
-        """Enable Dropout layers inside the head during eval mode."""
+        """Enable all head dropout in eval mode.
+
+        ``nn.MultiheadAttention`` applies attention dropout through its own ``training``
+        flag rather than a child module, so it has to be switched explicitly.
+        """
         for m in self.modules():
-            if isinstance(m, (nn.Dropout, nn.Dropout2d)):
+            if isinstance(m, (nn.Dropout, nn.Dropout2d, nn.MultiheadAttention)):
                 m.train()
+
+    def _sigma_px(self, log_var: Tensor) -> Tensor:
+        """Convert predicted log-variance (units of sigma_0) to input pixels."""
+        s_x = torch.clamp(log_var[..., 0], min=-8.0, max=6.0)
+        s_y = torch.clamp(log_var[..., 1], min=-8.0, max=6.0)
+        sigma0_px = float(self.loss_module.base_sigma) / self.simcc_split_ratio \
+            if hasattr(self.loss_module, 'base_sigma') else 1.0
+        return sigma0_px * torch.sqrt(torch.exp(s_x) + torch.exp(s_y))
 
     def predict(
         self,
@@ -391,41 +419,59 @@ class UASimCCHead(SimCCHead):
             batch_log_var = (_log_var + _log_var_f) * 0.5
             batch_vis = (_vis + _vis_f) * 0.5
             base_feats_for_mc = _feats
+            # Flip disagreement: comes free with flip testing (units: input pixels).
+            ratio = self.simcc_split_ratio
+            flip_dx = (_pred_x.argmax(-1) - _pred_x_f.argmax(-1)).float() / ratio
+            flip_dy = (_pred_y.argmax(-1) - _pred_y_f.argmax(-1)).float() / ratio
+            flip_dist = torch.sqrt(flip_dx**2 + flip_dy**2)
         else:
             batch_pred_x, batch_pred_y, batch_log_var, batch_vis = (
                 self.forward_with_uncertainty(feats))
             base_feats_for_mc = feats
+            flip_dist = None
 
         preds = self.decode((batch_pred_x, batch_pred_y))
 
-        # 1. Learned heteroscedastic sigma: sqrt(sigma_x^2 + sigma_y^2)
-        s_x = torch.clamp(batch_log_var[..., 0], min=-6.0, max=4.0)
-        s_y = torch.clamp(batch_log_var[..., 1], min=-6.0, max=4.0)
-        het_sigma = torch.sqrt(torch.exp(s_x) + torch.exp(s_y))  # [B, K]
+        # 1. Learned heteroscedastic sigma in input pixels
+        het_sigma = self._sigma_px(batch_log_var)  # [B, K]
+        if flip_dist is None:
+            flip_dist = torch.zeros_like(het_sigma)
 
-        # 2. Intrinsic 1D SimCC distribution spread & entropy
-        dist_std, dist_entropy = self.compute_simcc_distribution_metrics(
-            batch_pred_x, batch_pred_y)
+        # 2. Intrinsic 1D SimCC distribution spread, entropy and peak probability
+        dist_std, dist_entropy, peak_prob = self.compute_simcc_distribution_metrics(
+            batch_pred_x, batch_pred_y, self.simcc_split_ratio)
 
-        # 3. Optional MC-Dropout multi-pass coordinate std
+        # 3. Optional MC-Dropout multi-pass coordinate std (input pixels). Two decoders:
+        # argmax matches the deployed prediction but ties at zero, the soft expectation
+        # is continuous. Both are kept so the baseline is not handicapped by a choice.
         if mode == 'mc_dropout':
             was_training = self.training
             self._enable_mc_dropout()
-            mc_coords = []
+            mc_coords, mc_soft = [], []
             with torch.no_grad():
                 for _ in range(mc_samples):
                     px_i, py_i, _, _ = self.forward_with_uncertainty(
                         base_feats_for_mc)
-                    # Argmax decoded coordinates in [0, 1]
-                    cx = torch.argmax(px_i, dim=-1).float() / max(px_i.size(-1) - 1, 1)
-                    cy = torch.argmax(py_i, dim=-1).float() / max(py_i.size(-1) - 1, 1)
+                    ratio = self.simcc_split_ratio
+                    cx = torch.argmax(px_i, dim=-1).float() / ratio
+                    cy = torch.argmax(py_i, dim=-1).float() / ratio
                     mc_coords.append(torch.stack([cx, cy], dim=-1))
+                    grid_x = torch.arange(
+                        px_i.size(-1), device=px_i.device, dtype=px_i.dtype) / ratio
+                    grid_y = torch.arange(
+                        py_i.size(-1), device=py_i.device, dtype=py_i.dtype) / ratio
+                    sx = (F.softmax(px_i, dim=-1) * grid_x).sum(-1)
+                    sy = (F.softmax(py_i, dim=-1) * grid_y).sum(-1)
+                    mc_soft.append(torch.stack([sx, sy], dim=-1))
             self.train(was_training)
             # Stack [T, B, K, 2] -> std across T passes -> norm across (x, y)
-            mc_stack = torch.stack(mc_coords, dim=0)
-            mc_std = torch.sqrt(mc_stack.var(dim=0).sum(dim=-1) + 1e-8)
+            mc_std = torch.sqrt(
+                torch.stack(mc_coords, dim=0).var(dim=0).sum(dim=-1) + 1e-8)
+            mc_soft_std = torch.sqrt(
+                torch.stack(mc_soft, dim=0).var(dim=0).sum(dim=-1) + 1e-8)
         else:
             mc_std = torch.zeros_like(het_sigma)
+            mc_soft_std = torch.zeros_like(het_sigma)
 
         # Select primary uncertainty score
         if mode == 'heteroscedastic':
@@ -444,7 +490,10 @@ class UASimCCHead(SimCCHead):
         dist_std_np = to_numpy(dist_std)
         dist_entropy_np = to_numpy(dist_entropy)
         mc_std_np = to_numpy(mc_std)
-        vis_prob_np = to_numpy(torch.sigmoid(batch_vis))
+        mc_soft_np = to_numpy(mc_soft_std)
+        flip_np = to_numpy(flip_dist)
+        peak_np = to_numpy(peak_prob)
+        pred_oks_np = to_numpy(torch.sigmoid(batch_vis))
 
         for i, pred_inst in enumerate(preds):
             # Shape [1, K] to match pred_inst.keypoint_scores [1, K]
@@ -453,7 +502,10 @@ class UASimCCHead(SimCCHead):
             pred_inst.uncertainty_dist_std = dist_std_np[i:i + 1]
             pred_inst.uncertainty_entropy = dist_entropy_np[i:i + 1]
             pred_inst.uncertainty_mc = mc_std_np[i:i + 1]
-            pred_inst.predicted_visibility = vis_prob_np[i:i + 1]
+            pred_inst.uncertainty_mc_soft = mc_soft_np[i:i + 1]
+            pred_inst.uncertainty_flip = flip_np[i:i + 1]
+            pred_inst.peak_prob = peak_np[i:i + 1]
+            pred_inst.predicted_oks = pred_oks_np[i:i + 1]
 
             # Save raw uncalibrated confidence before optional OKS rescoring
             pred_inst.raw_keypoint_scores = pred_inst.keypoint_scores.copy()

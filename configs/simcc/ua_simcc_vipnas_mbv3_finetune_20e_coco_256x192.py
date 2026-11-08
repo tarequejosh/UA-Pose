@@ -1,17 +1,18 @@
 """Fast Fine-Tuning Config (20 Epochs) for UA-SimCC + ViPNAS-MobileNetV3.
 
-Loads the official COCO-pretrained MMPose SimCC ViPNAS-MobileNetV3 checkpoint
-(69.5 AP, ultra-lightweight mobile backbone) and trains the PCT Compositional
-Token Mixer + Heteroscedastic Uncertainty Head in ~15-20 minutes on RTX 5060.
+Loads the official COCO-pretrained MMPose SimCC ViPNAS-MobileNetV3 checkpoint and
+trains the Compositional Token Mixer + Heteroscedastic Uncertainty Head.
 """
 _base_ = ['./ua_simcc_vipnas_mbv3_coco_256x192.py']
 
-load_from = (
-    'https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/simcc/'
-    'coco/simcc_vipnas-mbv3_8xb64-210e_coco-256x192-719f3489_20220922.pth'
-)
+load_from = 'checkpoints/simcc_vipnas_mbv3_256x192.pth'
 
-train_cfg = dict(max_epochs=20, val_interval=2)
+train_cfg = dict(max_epochs=20, val_interval=5)
+
+# The paper reports the final epoch: picking a best epoch would select on val2017.
+default_hooks = dict(
+    checkpoint=dict(interval=5, save_best=None, max_keep_ckpts=1),
+)
 
 optim_wrapper = dict(
     type='AmpOptimWrapper',

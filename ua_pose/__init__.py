@@ -1,4 +1,5 @@
 """Uncertainty-Aware Lightweight Pose Estimation Extension for MMPose."""
+from . import compat  # noqa: F401  (must run before mmpose is imported)
 from .backbones import (GlobalContextBlock, SOCAPRNet,
                         SpatiallyOrientedContextualAttention)
 from .evaluation import (UncertaintyPoseMetric, compute_auroc, compute_ece,
@@ -17,5 +18,6 @@ __all__ = [
     'HeteroscedasticHeatmapLoss',
     'UncertaintyPoseMetric',
     'compute_auroc',
+    'compute_ece',
     'compute_risk_coverage_and_ause',
 ]

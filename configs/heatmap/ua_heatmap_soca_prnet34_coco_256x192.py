@@ -84,14 +84,15 @@ model = dict(
         flip_mode='heatmap',
         shift_heatmap=True,
         uncertainty_mode='combined',
-        calibrate_scores=True,
-        calibration_alpha=0.2,
+        calibrate_scores=False,
     ),
 )
 
 dataset_type = 'CocoDataset'
 data_mode = 'topdown'
 data_root = 'data/coco/'
+# Explicit, because MMPose's own lookup needs links made by its legacy installer.
+metainfo = dict(from_file='mmpose/configs/_base_/datasets/coco.py')
 
 train_pipeline = [
     dict(type='LoadImage'),
@@ -120,6 +121,7 @@ train_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         data_mode=data_mode,
+        metainfo=metainfo,
         ann_file='annotations/person_keypoints_train2017.json',
         data_prefix=dict(img='train2017/'),
         pipeline=train_pipeline,
@@ -136,6 +138,7 @@ val_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         data_mode=data_mode,
+        metainfo=metainfo,
         ann_file='annotations/person_keypoints_val2017.json',
         data_prefix=dict(img='val2017/'),
         test_mode=True,

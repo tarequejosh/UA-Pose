@@ -1,0 +1,14 @@
+\begin{tabular}{lccccccccc}
+\toprule
+& & \multicolumn{3}{c}{Failure AUROC} & \multicolumn{2}{c}{Spread minus} & Occl.\ AUROC & \multicolumn{2}{c}{Occl.\ coverage} \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-7}\cmidrule(lr){9-10}
+Model & PCK occl. & Peak conf. & Spread & MC soft & MC soft & Peak conf. & spread $-$ conf. & Const. & Spread \\
+\midrule
+SimCC-ViPNAS-MBV3 & 0.425 & 0.736 & 0.750 & 0.690 & +0.059 & +0.013 & \ensuremath{-}0.016 & 0.850 & 0.848 \\
+SimCC-ResNet-50 & 0.406 & 0.734 & 0.744 & 0.716 & +0.029 & +0.011 & \ensuremath{-}0.022 & 0.842 & 0.837 \\
+Heatmap-ResNet-50$^{\ast}$ & 0.422 & 0.721 & 0.721 & 0.658 & +0.062 & \ensuremath{-}0.001 & \ensuremath{-}0.005 & 0.840 & 0.844 \\
+RTMPose-t & 0.419 & 0.770 & 0.771 & 0.741 & +0.030 & +0.001 & \ensuremath{-}0.044 & 0.840 & 0.850 \\
+RTMPose-s & 0.439 & 0.767 & 0.765 & 0.734 & +0.031 & \ensuremath{-}0.002 & \ensuremath{-}0.057 & 0.837 & 0.843 \\
+RTMPose-m & 0.457 & 0.759 & 0.761 & 0.743 & +0.019 & +0.002 & \ensuremath{-}0.058 & 0.837 & 0.841 \\
+\bottomrule
+\end{tabular}

@@ -10,6 +10,10 @@ custom_imports = dict(
     allow_failed_imports=False,
 )
 
+# Inputs have a fixed size, so letting cuDNN pick algorithms is safe: measured about 12%
+# faster per iteration on the RTX 5060 (0.248 s vs 0.281 s, ViPNAS-MBV3).
+env_cfg = dict(cudnn_benchmark=True)
+
 # runtime
 train_cfg = dict(max_epochs=210, val_interval=10)
 
@@ -90,14 +94,17 @@ model = dict(
             het_weight=0.5,
             cal_weight=0.2,
             vis_weight=0.2,
+            simcc_split_ratio=codec['simcc_split_ratio'],
+            oks_area_px=9850.0,  # scripts/compute_oks_area.py, COCO train2017 median
         ),
         decoder=codec,
     ),
+    # Scores stay raw here. Rescoring needs a parameter fitted on held-out data, so it
+    # happens offline in scripts/rescore_ap.py rather than with a hand-set alpha.
     test_cfg=dict(
         flip_test=True,
         uncertainty_mode='combined',
-        calibrate_scores=True,
-        calibration_alpha=0.2,
+        calibrate_scores=False,
     ),
 )
 
@@ -105,6 +112,8 @@ model = dict(
 dataset_type = 'CocoDataset'
 data_mode = 'topdown'
 data_root = 'data/coco/'
+# Explicit, because MMPose's own lookup needs links made by its legacy installer.
+metainfo = dict(from_file='mmpose/configs/_base_/datasets/coco.py')
 
 train_pipeline = [
     dict(type='LoadImage'),
@@ -125,15 +134,20 @@ val_pipeline = [
 ]
 
 # DataLoaders tuned for Windows + Core Ultra i7 + RTX 5060
+# Keep worker counts low on Windows: every spawned worker loads the CUDA DLLs and commits
+# several GB of virtual memory, and too many of them fail with WinError 1455. Four train
+# workers already leave the GPU as the bottleneck (data_time ~0.003 s at batch 64).
 train_dataloader = dict(
     batch_size=64,
     num_workers=4,
     persistent_workers=True,
+    pin_memory=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
         data_mode=data_mode,
+        metainfo=metainfo,
         ann_file='annotations/person_keypoints_train2017.json',
         data_prefix=dict(img='train2017/'),
         pipeline=train_pipeline,
@@ -142,7 +156,7 @@ train_dataloader = dict(
 
 val_dataloader = dict(
     batch_size=64,
-    num_workers=4,
+    num_workers=2,
     persistent_workers=True,
     drop_last=False,
     sampler=dict(type='DefaultSampler', shuffle=False, round_up=False),
@@ -150,6 +164,7 @@ val_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         data_mode=data_mode,
+        metainfo=metainfo,
         ann_file='annotations/person_keypoints_val2017.json',
         data_prefix=dict(img='val2017/'),
         test_mode=True,

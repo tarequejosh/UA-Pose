@@ -1,18 +1,20 @@
 """Fast Fine-Tuning Config (20 Epochs) for UA-SimCC + ResNet-50.
 
 Loads the official COCO-pretrained MMPose SimCC ResNet-50 checkpoint so the
-backbone, deconv layers, and 1D coordinate classifiers start at 72.1 AP, and
-rapidly trains the PCT Compositional Token Mixer + Heteroscedastic Uncertainty
-Head on a single RTX 5060 GPU (~30-45 minutes for 20 epochs).
+backbone, deconv layers, and 1D coordinate classifiers start from the published
+weights, then trains the Compositional Token Mixer + Heteroscedastic Uncertainty
+Head on a single GPU.
 """
 _base_ = ['./ua_simcc_res50_coco_256x192.py']
 
-load_from = (
-    'https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/simcc/'
-    'coco/simcc_res50_8xb64-210e_coco-256x192-8e0f5b59_20220919.pth'
-)
+load_from = 'checkpoints/simcc_res50_256x192.pth'
 
-train_cfg = dict(max_epochs=20, val_interval=2)
+train_cfg = dict(max_epochs=20, val_interval=5)
+
+# The paper reports the final epoch: picking a best epoch would select on val2017.
+default_hooks = dict(
+    checkpoint=dict(interval=5, save_best=None, max_keep_ckpts=1),
+)
 
 optim_wrapper = dict(
     type='AmpOptimWrapper',

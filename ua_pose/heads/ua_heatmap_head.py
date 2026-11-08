@@ -8,10 +8,11 @@ Provides:
 """
 from typing import Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import build_conv_layer, build_upsample_layer
+from mmcv.cnn import build_upsample_layer
 from mmengine.structures import PixelData
 from torch import Tensor
 
@@ -108,7 +109,12 @@ class UAHeatmapHead(HeatmapHead):
         layer_out_channels: Sequence[int],
         layer_kernel_sizes: Sequence[int],
     ) -> nn.Module:
-        """Create deconvolutional layers with Dropout2d after each ReLU."""
+        """Create deconvolutional layers with Dropout2d after each ReLU.
+
+        The ReLU and dropout share one slot so the Sequential keeps HeatmapHead's
+        indices (deconv at 0/3/6, BN at 1/4/7). Appending dropout as its own slot shifts
+        those keys, and a non-strict load then silently drops pretrained weights.
+        """
         layers = []
         for out_channels, kernel_size in zip(layer_out_channels,
                                              layer_kernel_sizes):
@@ -135,9 +141,11 @@ class UAHeatmapHead(HeatmapHead):
             )
             layers.append(build_upsample_layer(cfg))
             layers.append(nn.BatchNorm2d(num_features=out_channels))
-            layers.append(nn.ReLU(inplace=True))
             if self.dropout_rate > 0:
-                layers.append(nn.Dropout2d(p=self.dropout_rate))
+                layers.append(nn.Sequential(
+                    nn.ReLU(inplace=True), nn.Dropout2d(p=self.dropout_rate)))
+            else:
+                layers.append(nn.ReLU(inplace=True))
             in_channels = out_channels
 
         return nn.Sequential(*layers)
@@ -186,6 +194,22 @@ class UAHeatmapHead(HeatmapHead):
         ) / float(np.log(h * w))  # [B, K]
         return coords, spatial_std, entropy
 
+    @staticmethod
+    def _peak_coords_px(heatmaps: Tensor, stride: float = 4.0) -> Tensor:
+        """Integer heatmap peak in input pixels [B, K, 2]."""
+        b, k, h, w = heatmaps.shape
+        idx = heatmaps.view(b, k, -1).argmax(dim=-1)
+        x = (idx % w).float()
+        y = torch.div(idx, w, rounding_mode='floor').float()
+        return torch.stack([x, y], dim=-1) * stride
+
+    def _peak_distance_px(self, hm_a: Tensor, hm_b: Tensor) -> Tensor:
+        """Distance between the peaks of two heatmaps in input pixels [B, K]."""
+        stride = float(self.decoder.input_size[0]) / hm_a.shape[-1] \
+            if self.decoder is not None else 4.0
+        delta = self._peak_coords_px(hm_a, stride) - self._peak_coords_px(hm_b, stride)
+        return torch.sqrt((delta**2).sum(dim=-1))
+
     def _enable_mc_dropout(self) -> None:
         for m in self.modules():
             if isinstance(m, (nn.Dropout, nn.Dropout2d)):
@@ -216,33 +240,46 @@ class UAHeatmapHead(HeatmapHead):
             batch_heatmaps = (_hm + _hm_flip) * 0.5
             batch_log_var = (_log_var + _log_var_flip) * 0.5
             base_feats_for_mc = _feats
+            flip_dist = self._peak_distance_px(_hm, _hm_flip)
         else:
             batch_heatmaps, batch_log_var = self.forward_with_uncertainty(feats)
             base_feats_for_mc = feats
+            flip_dist = None
 
         preds = self.decode(batch_heatmaps)
 
-        s_x = torch.clamp(batch_log_var[..., 0], min=-6.0, max=4.0)
-        s_y = torch.clamp(batch_log_var[..., 1], min=-6.0, max=4.0)
+        s_x = torch.clamp(batch_log_var[..., 0], min=-8.0, max=6.0)
+        s_y = torch.clamp(batch_log_var[..., 1], min=-8.0, max=6.0)
         het_sigma = torch.sqrt(torch.exp(s_x) + torch.exp(s_y))  # [B, K]
+        if flip_dist is None:
+            flip_dist = torch.zeros_like(het_sigma)
 
         _, spatial_std, dist_entropy = self.compute_heatmap_spatial_spread(
             batch_heatmaps)
 
+        # MC-Dropout std in input pixels: the normalised axes have different lengths.
+        h, w = batch_heatmaps.shape[-2:]
+        stride = float(self.decoder.input_size[0]) / w if self.decoder is not None else 4.0
+        axis_px = batch_heatmaps.new_tensor([(w - 1) * stride, (h - 1) * stride])
+
         if mode == 'mc_dropout':
             was_training = self.training
             self._enable_mc_dropout()
-            mc_coords = []
+            mc_coords, mc_peaks = [], []
             with torch.no_grad():
                 for _ in range(mc_samples):
                     hm_i = self.forward(base_feats_for_mc)
                     coords_i, _, _ = self.compute_heatmap_spatial_spread(hm_i)
-                    mc_coords.append(coords_i)
+                    mc_coords.append(coords_i * axis_px)
+                    mc_peaks.append(self._peak_coords_px(hm_i, stride))
             self.train(was_training)
-            mc_stack = torch.stack(mc_coords, dim=0)  # [T, B, K, 2]
-            mc_std = torch.sqrt(mc_stack.var(dim=0).sum(dim=-1) + 1e-8)
+            mc_soft_std = torch.sqrt(
+                torch.stack(mc_coords, dim=0).var(dim=0).sum(dim=-1) + 1e-8)
+            mc_std = torch.sqrt(
+                torch.stack(mc_peaks, dim=0).var(dim=0).sum(dim=-1) + 1e-8)
         else:
             mc_std = torch.zeros_like(het_sigma)
+            mc_soft_std = torch.zeros_like(het_sigma)
 
         if mode == 'heteroscedastic':
             primary_unc = het_sigma
@@ -260,6 +297,8 @@ class UAHeatmapHead(HeatmapHead):
         spatial_std_np = to_numpy(spatial_std)
         dist_entropy_np = to_numpy(dist_entropy)
         mc_std_np = to_numpy(mc_std)
+        mc_soft_np = to_numpy(mc_soft_std)
+        flip_np = to_numpy(flip_dist)
 
         for i, pred_inst in enumerate(preds):
             pred_inst.keypoint_uncertainty = primary_unc_np[i:i + 1]
@@ -267,6 +306,8 @@ class UAHeatmapHead(HeatmapHead):
             pred_inst.uncertainty_dist_std = spatial_std_np[i:i + 1]
             pred_inst.uncertainty_entropy = dist_entropy_np[i:i + 1]
             pred_inst.uncertainty_mc = mc_std_np[i:i + 1]
+            pred_inst.uncertainty_mc_soft = mc_soft_np[i:i + 1]
+            pred_inst.uncertainty_flip = flip_np[i:i + 1]
             pred_inst.raw_keypoint_scores = pred_inst.keypoint_scores.copy()
 
             if test_cfg.get('calibrate_scores', False):

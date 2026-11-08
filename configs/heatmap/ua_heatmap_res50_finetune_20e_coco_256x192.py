@@ -6,12 +6,14 @@ also supporting 20-pass MC-Dropout in the deconv layers.
 """
 _base_ = ['./ua_heatmap_res50_coco_256x192.py']
 
-load_from = (
-    'https://download.openmmlab.com/mmpose/v1/body_2d_keypoint/'
-    'topdown_heatmap/coco/td-hm_res50_8xb64-210e_coco-256x192-04af38ce_20220923.pth'
-)
+load_from = 'checkpoints/td_hm_res50_256x192.pth'
 
-train_cfg = dict(max_epochs=20, val_interval=2)
+train_cfg = dict(max_epochs=20, val_interval=5)
+
+# The paper reports the final epoch: picking a best epoch would select on val2017.
+default_hooks = dict(
+    checkpoint=dict(interval=5, save_best=None, max_keep_ckpts=1),
+)
 
 optim_wrapper = dict(
     type='AmpOptimWrapper',
